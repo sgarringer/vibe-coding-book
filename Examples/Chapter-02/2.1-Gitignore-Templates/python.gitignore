@@ -1,0 +1,152 @@
+# ============================================
+# PYTHON .GITIGNORE
+# ============================================
+# Security-focused template for Python projects
+# ============================================
+
+# ============================================
+# BYTE-COMPILED / OPTIMIZED
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ============================================
+# DISTRIBUTION / PACKAGING
+# ============================================
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ============================================
+# VIRTUAL ENVIRONMENTS
+# ============================================
+venv/
+ENV/
+env/
+.venv/
+.ENV/
+.env/
+
+# ============================================
+# TESTING
+# ============================================
+.tox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+htmlcov/
+.hypothesis/
+
+# ============================================
+# JUPYTER NOTEBOOK
+# ============================================
+.ipynb_checkpoints
+*.ipynb
+
+# ============================================
+# ENVIRONMENT VARIABLES
+# ============================================
+.env
+.env.*
+!.env.example
+.flaskenv
+
+# ============================================
+# DATABASE
+# ============================================
+*.db
+*.sqlite
+*.sqlite3
+db.sqlite3
+db.sqlite3-journal
+
+# ============================================
+# DJANGO
+# ============================================
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+/media
+/staticfiles
+
+# ============================================
+# FLASK
+# ============================================
+instance/
+.webassets-cache
+
+# ============================================
+# SCRAPY
+# ============================================
+.scrapy
+
+# ============================================
+# SPHINX DOCUMENTATION
+# ============================================
+docs/_build/
+
+# ============================================
+# PYBUILDER
+# ============================================
+target/
+
+# ============================================
+# CELERY
+# ============================================
+celerybeat-schedule
+celerybeat.pid
+
+# ============================================
+# SECURITY-SPECIFIC (Python)
+# ============================================
+# Django secret key
+**/secret_key.txt
+**/django_secret_key
+
+# Database credentials
+**/database.ini
+**/db_config.py
+
+# API keys
+**/api_keys.py
+**/credentials.py
+
+# AWS credentials
+.aws/
+**/boto.cfg
+
+# Google Cloud credentials
+**/gcp-key*.json
+**/service-account*.json
+
+# SSL certificates
+*.pem
+*.key
+*.crt
+
+# OAuth secrets
+**/oauth_credentials.json
+**/client_secrets.json
+
+# Stripe keys
+**/stripe_keys.py
+
+# SendGrid keys
+**/sendgrid_key.txt

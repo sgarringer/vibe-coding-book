@@ -1,0 +1,231 @@
+# ============================================
+# SECURITY-FOCUSED .GITIGNORE ADDITIONS
+# ============================================
+# Add these rules to your existing .gitignore to prevent
+# accidental commits of sensitive data.
+#
+# Referenced in: Vibe-Coded App Security Framework
+# Chapter 2.1.1: The .gitignore File
+# ============================================
+
+# ============================================
+# ENVIRONMENT VARIABLES & SECRETS
+# ============================================
+.env
+.env.*
+!.env.example
+!.env.template
+.envrc
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# ============================================
+# API KEYS & CREDENTIALS
+# ============================================
+**/secrets/
+**/credentials/
+**/*secret*
+**/*credential*
+**/*password*
+**/*apikey*
+**/*api-key*
+**/*api_key*
+**/service-account*.json
+**/serviceAccount*.json
+
+# ============================================
+# CLOUD PROVIDER CREDENTIALS
+# ============================================
+# AWS
+.aws/credentials
+.aws/config
+**/aws-credentials*
+**/*accessKeys.csv
+
+# Google Cloud
+**/gcloud/
+**/*gcp-key*.json
+**/*google-credentials*.json
+application_default_credentials.json
+
+# Azure
+.azure/
+**/azure-credentials*
+**/*azureProfile.json
+
+# ============================================
+# DATABASE CREDENTIALS
+# ============================================
+**/database.yml
+**/database.ini
+**/db-config.*
+**/*connection-string*
+**/*connectionstring*
+
+# ============================================
+# SSL/TLS CERTIFICATES & KEYS
+# ============================================
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+*.jks
+*.keystore
+**/ssl/
+**/certs/private/
+!**/certs/public/
+
+# ============================================
+# SSH KEYS
+# ============================================
+id_rsa
+id_rsa.*
+id_dsa
+id_dsa.*
+id_ecdsa
+id_ecdsa.*
+id_ed25519
+id_ed25519.*
+*.ppk
+**/.ssh/id_*
+**/.ssh/*_rsa*
+
+# ============================================
+# AUTHENTICATION TOKENS
+# ============================================
+.npmrc
+.pypirc
+.gem/credentials
+.docker/config.json
+**/*token*
+**/*auth-token*
+**/*access-token*
+**/*refresh-token*
+
+# ============================================
+# SESSION & COOKIE SECRETS
+# ============================================
+**/session-secret*
+**/cookie-secret*
+**/jwt-secret*
+
+# ============================================
+# BACKUP FILES (May Contain Secrets)
+# ============================================
+*.bak
+*.backup
+*.old
+*.orig
+*.save
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ============================================
+# LOG FILES (May Contain Secrets)
+# ============================================
+*.log
+logs/
+**/logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ============================================
+# IDE CONFIGURATION (May Contain Secrets)
+# ============================================
+.vscode/settings.json
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/dataSources.xml
+.idea/dataSources.ids
+.idea/httpRequests/
+
+# ============================================
+# TERRAFORM STATE (Contains Secrets)
+# ============================================
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+!*.example.tfvars
+.terraform/
+terraform.rc
+.terraformrc
+
+# ============================================
+# ANSIBLE VAULT (Encrypted Secrets)
+# ============================================
+**/vault-password.txt
+**/vault-pass.txt
+**/.vault-pass
+
+# ============================================
+# KUBERNETES SECRETS
+# ============================================
+**/kubeconfig
+**/kube-config
+**/.kube/config
+**/k8s-secrets*.yaml
+**/kubernetes-secrets*.yaml
+
+# ============================================
+# DOCKER SECRETS
+# ============================================
+**/docker-compose.override.yml
+**/docker-compose.secrets.yml
+
+# ============================================
+# CI/CD SECRETS
+# ============================================
+.gitlab-ci-local/
+**/.github/secrets/
+**/jenkins-secrets/
+
+# ============================================
+# PAYMENT PROVIDER KEYS
+# ============================================
+# Stripe
+**/stripe-key*
+**/stripe_key*
+
+# PayPal
+**/paypal-credentials*
+
+# Square
+**/square-credentials*
+
+# ============================================
+# EMAIL SERVICE KEYS
+# ============================================
+**/sendgrid-key*
+**/mailgun-key*
+**/ses-credentials*
+
+# ============================================
+# MONITORING & ANALYTICS KEYS
+# ============================================
+**/datadog-key*
+**/newrelic-key*
+**/sentry-dsn*
+
+# ============================================
+# COMMON SECRET FILE PATTERNS
+# ============================================
+secret
+secrets
+secret.txt
+secrets.txt
+secret.json
+secrets.json
+secret.yaml
+secrets.yaml
+secret.yml
+secrets.yml
+private.key
+private-key.txt

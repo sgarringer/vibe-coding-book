@@ -1,0 +1,31 @@
+# ============================================
+# AZURE TERRAFORM VARIABLES
+# ============================================
+# Copy this file to terraform.tfvars and fill in your values
+# cp terraform.tfvars.example terraform.tfvars
+# ============================================
+
+# Resource Group
+resource_group_name = "yourapp-rg"
+
+# Location
+location = "East US"
+
+# Application Name
+app_name = "yourapp"
+
+# Network Configuration
+vnet_address_space    = ["10.0.0.0/16"]
+subnet_address_prefix = "10.0.1.0/24"
+
+# Backend Servers
+# List of IP addresses or FQDNs of your backend servers
+backend_address_pool = [
+  "backend1.yourapp.com",
+  "backend2.yourapp.com"
+]
+
+# WAF Configuration
+waf_mode             = "Prevention"  # or "Detection"
+waf_rule_set_version = "3.2"
+enable_bot_protection = true

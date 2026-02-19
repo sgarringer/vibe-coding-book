@@ -1,0 +1,30 @@
+[
+  {
+    "ParameterKey": "ApplicationName",
+    "ParameterValue": "yourapp"
+  },
+  {
+    "ParameterKey": "ALBArn",
+    "ParameterValue": "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/yourapp-alb/1234567890abcdef"
+  },
+  {
+    "ParameterKey": "RateLimitLogin",
+    "ParameterValue": "100"
+  },
+  {
+    "ParameterKey": "RateLimitAPI",
+    "ParameterValue": "2000"
+  },
+  {
+    "ParameterKey": "EnableGeoBlocking",
+    "ParameterValue": "false"
+  },
+  {
+    "ParameterKey": "BlockedCountries",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "AlarmEmail",
+    "ParameterValue": "admin@yourapp.com"
+  }
+]

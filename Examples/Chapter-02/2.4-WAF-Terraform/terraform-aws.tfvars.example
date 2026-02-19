@@ -1,0 +1,26 @@
+# ============================================
+# TERRAFORM VARIABLES EXAMPLE
+# ============================================
+# Copy this file to terraform.tfvars and fill in your values
+# cp terraform.tfvars.example terraform.tfvars
+# ============================================
+
+# AWS Configuration
+aws_region = "us-east-1"
+app_name   = "yourapp"
+
+# Application Load Balancer ARN
+# Find in AWS Console: EC2 → Load Balancers → Copy ARN
+alb_arn = "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/yourapp-alb/1234567890abcdef"
+
+# Rate Limiting
+rate_limit_login = 100   # 100 requests per 5 minutes per IP
+rate_limit_api   = 2000  # 2000 requests per 5 minutes per IP
+
+# Geo-Blocking (Optional)
+enable_geo_blocking = false
+blocked_countries   = []  # Example: ["CN", "RU", "KP"]
+
+# If enabling geo-blocking, uncomment and add country codes:
+# enable_geo_blocking = true
+# blocked_countries   = ["CN", "RU", "KP", "IR"]

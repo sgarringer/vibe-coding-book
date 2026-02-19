@@ -1,0 +1,409 @@
+# ============================================
+# AWS WAF WITH APPLICATION LOAD BALANCER
+# CloudFormation Template
+# ============================================
+# Referenced in: Vibe-Coded App Security Framework
+# Chapter 2.4.2: WAF Deployment
+#
+# This template creates:
+# - AWS WAFv2 Web ACL
+# - AWS Managed Rule Groups
+# - Custom rate limiting rules
+# - CloudWatch logging and alarms
+# - Association with ALB
+# ============================================
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS WAF for Application Load Balancer with managed rules and rate limiting'
+
+# ============================================
+# PARAMETERS
+# ============================================
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Description: Application name (used for resource naming)
+    Default: yourapp
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  ALBArn:
+    Type: String
+    Description: ARN of the Application Load Balancer to protect
+    AllowedPattern: '^arn:aws:elasticloadbalancing:.*'
+    ConstraintDescription: Must be a valid ALB ARN
+
+  RateLimitLogin:
+    Type: Number
+    Description: Rate limit for login endpoint (requests per 5 minutes per IP)
+    Default: 100
+    MinValue: 10
+    MaxValue: 10000
+
+  RateLimitAPI:
+    Type: Number
+    Description: Rate limit for API endpoints (requests per 5 minutes per IP)
+    Default: 2000
+    MinValue: 100
+    MaxValue: 20000
+
+  EnableGeoBlocking:
+    Type: String
+    Description: Enable geographic blocking
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  BlockedCountries:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of country codes to block (e.g., CN,RU,KP)
+    Default: ''
+
+  AlarmEmail:
+    Type: String
+    Description: Email address for CloudWatch alarms
+    Default: admin@yourapp.com
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+# ============================================
+# CONDITIONS
+# ============================================
+
+Conditions:
+  EnableGeoBlockingCondition: !Equals [!Ref EnableGeoBlocking, 'true']
+  HasBlockedCountries: !Not [!Equals [!Join ['', !Ref BlockedCountries], '']]
+
+# ============================================
+# RESOURCES
+# ============================================
+
+Resources:
+
+  # ============================================
+  # WAF WEB ACL
+  # ============================================
+
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${ApplicationName}-waf'
+      Scope: REGIONAL
+      Description: !Sub 'WAF for ${ApplicationName}'
+      DefaultAction:
+        Allow: {}
+      
+      Rules:
+        # ============================================
+        # RULE 1: AWS MANAGED CORE RULE SET
+        # ============================================
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSetMetric
+
+        # ============================================
+        # RULE 2: AWS MANAGED KNOWN BAD INPUTS
+        # ============================================
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesKnownBadInputsRuleSetMetric
+
+        # ============================================
+        # RULE 3: AWS MANAGED SQL INJECTION
+        # ============================================
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesSQLiRuleSetMetric
+
+        # ============================================
+        # RULE 4: RATE LIMITING - LOGIN
+        # ============================================
+        - Name: RateLimitLogin
+          Priority: 10
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitLogin
+              AggregateKeyType: IP
+              ScopeDownStatement:
+                ByteMatchStatement:
+                  SearchString: '/login'
+                  FieldToMatch:
+                    UriPath: {}
+                  TextTransformations:
+                    - Priority: 0
+                      Type: LOWERCASE
+                  PositionalConstraint: CONTAINS
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitLoginMetric
+
+        # ============================================
+        # RULE 5: RATE LIMITING - API
+        # ============================================
+        - Name: RateLimitAPI
+          Priority: 11
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitAPI
+              AggregateKeyType: IP
+              ScopeDownStatement:
+                ByteMatchStatement:
+                  SearchString: '/api/'
+                  FieldToMatch:
+                    UriPath: {}
+                  TextTransformations:
+                    - Priority: 0
+                      Type: LOWERCASE
+                  PositionalConstraint: STARTS_WITH
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitAPIMetric
+
+        # ============================================
+        # RULE 6: GEO-BLOCKING (CONDITIONAL)
+        # ============================================
+        - !If
+          - EnableGeoBlockingCondition
+          - Name: GeoBlocking
+            Priority: 20
+            Action:
+              Block: {}
+            Statement:
+              GeoMatchStatement:
+                CountryCodes: !Ref BlockedCountries
+            VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: GeoBlockingMetric
+          - !Ref AWS::NoValue
+
+        # ============================================
+        # RULE 7: BLOCK COMMON ATTACKS
+        # ============================================
+        - Name: BlockCommonAttacks
+          Priority: 30
+          Action:
+            Block: {}
+          Statement:
+            OrStatement:
+              Statements:
+                # Path traversal
+                - ByteMatchStatement:
+                    SearchString: '../'
+                    FieldToMatch:
+                      UriPath: {}
+                    TextTransformations:
+                      - Priority: 0
+                        Type: URL_DECODE
+                    PositionalConstraint: CONTAINS
+                
+                # /etc/passwd
+                - ByteMatchStatement:
+                    SearchString: 'etc/passwd'
+                    FieldToMatch:
+                      UriPath: {}
+                    TextTransformations:
+                      - Priority: 0
+                        Type: LOWERCASE
+                    PositionalConstraint: CONTAINS
+                
+                # XSS in query string
+                - ByteMatchStatement:
+                    SearchString: '<script>'
+                    FieldToMatch:
+                      AllQueryArguments: {}
+                    TextTransformations:
+                      - Priority: 0
+                        Type: LOWERCASE
+                    PositionalConstraint: CONTAINS
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: BlockCommonAttacksMetric
+
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${ApplicationName}-waf-metric'
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-waf'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================
+  # ASSOCIATE WAF WITH ALB
+  # ============================================
+
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref ALBArn
+      WebACLArn: !GetAtt WebACL.Arn
+
+  # ============================================
+  # CLOUDWATCH LOG GROUP
+  # ============================================
+
+  WAFLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/waf/${ApplicationName}'
+      RetentionInDays: 30
+
+  # ============================================
+  # WAF LOGGING CONFIGURATION
+  # ============================================
+
+  WAFLoggingConfiguration:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Properties:
+      ResourceArn: !GetAtt WebACL.Arn
+      LogDestinationConfigs:
+        - !GetAtt WAFLogGroup.Arn
+      RedactedFields:
+        - SingleHeader:
+            Name: authorization
+        - SingleHeader:
+            Name: cookie
+
+  # ============================================
+  # SNS TOPIC FOR ALARMS
+  # ============================================
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-waf-alarms'
+      DisplayName: WAF Alarms
+      Subscription:
+        - Endpoint: !Ref AlarmEmail
+          Protocol: email
+
+  # ============================================
+  # CLOUDWATCH ALARM - BLOCKED REQUESTS
+  # ============================================
+
+  BlockedRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-waf-blocked-requests'
+      AlarmDescription: Alert when WAF blocks more than 100 requests
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: WebACL
+          Value: !GetAtt WebACL.Name
+        - Name: Region
+          Value: !Ref AWS::Region
+        - Name: Rule
+          Value: ALL
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  # ============================================
+  # CLOUDWATCH ALARM - RATE LIMIT TRIGGERED
+  # ============================================
+
+  RateLimitAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-waf-rate-limit'
+      AlarmDescription: Alert when rate limiting is triggered frequently
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: WebACL
+          Value: !GetAtt WebACL.Name
+        - Name: Region
+          Value: !Ref AWS::Region
+        - Name: Rule
+          Value: RateLimitLogin
+      AlarmActions:
+        - !Ref AlarmTopic
+
+# ============================================
+# OUTPUTS
+# ============================================
+
+Outputs:
+  WebACLId:
+    Description: WAF Web ACL ID
+    Value: !GetAtt WebACL.Id
+    Export:
+      Name: !Sub '${AWS::StackName}-WebACLId'
+
+  WebACLArn:
+    Description: WAF Web ACL ARN
+    Value: !GetAtt WebACL.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WebACLArn'
+
+  WebACLName:
+    Description: WAF Web ACL Name
+    Value: !GetAtt WebACL.Name
+    Export:
+      Name: !Sub '${AWS::StackName}-WebACLName'
+
+  LogGroupName:
+    Description: CloudWatch Log Group for WAF logs
+    Value: !Ref WAFLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  DashboardURL:
+    Description: AWS Console URL for WAF dashboard
+    Value: !Sub 'https://console.aws.amazon.com/wafv2/homev2/web-acl/${WebACL.Name}/${WebACL.Id}/overview?region=${AWS::Region}'
+
+  AlarmTopicArn:
+    Description: SNS Topic ARN for alarms
+    Value: !Ref AlarmTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmTopicArn'

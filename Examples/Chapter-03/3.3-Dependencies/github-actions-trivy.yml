@@ -1,0 +1,337 @@
+# =============================================================================
+# GitHub Actions - Dependency Scanning with Trivy
+# Book Reference: Chapter 3, Section 3.3.2.2
+# =============================================================================
+# Features demonstrated:
+#   - Filesystem and config scanning
+#   - Configurable severity thresholds
+#   - PR comments with results
+#   - Scheduled daily scans
+# =============================================================================
+#
+# SETUP REQUIRED:
+#   1. No secrets required for basic scanning
+#   2. Set SLACK_WEBHOOK_URL secret for notifications (optional)
+#   3. Copy .trivyignore.example to .trivyignore in your repo root
+#      and customize for your false positives
+#
+# TRIVY SCAN TYPES:
+#   fs     : Filesystem scan - finds vulns in dependencies
+#   config : IaC scan - finds misconfigs in Terraform, K8s, etc.
+#   image  : Container image scan
+#   repo   : Remote git repository scan
+# =============================================================================
+
+name: Dependency Scan - Trivy
+
+on:
+  push:
+    branches: [ main, develop, staging ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 0 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BREAK_ON_SEVERITY: "CRITICAL,HIGH"
+  REPORT_SEVERITY: "CRITICAL,HIGH,MEDIUM"
+  TRIVY_CACHE_DIR: .trivy-cache
+
+jobs:
+
+  trivy-fs-scan:
+    name: Trivy Filesystem Scan
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+
+    outputs:
+      critical_count: ${{ steps.counts.outputs.critical }}
+      high_count: ${{ steps.counts.outputs.high }}
+      medium_count: ${{ steps.counts.outputs.medium }}
+      gate_status: ${{ steps.gate.outputs.status }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v3
+        with:
+          path: ${{ env.TRIVY_CACHE_DIR }}
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: trivy-db-
+
+      - name: Run Trivy filesystem scan JSON
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: trivy-fs-results.json
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: 0
+          ignore-unfixed: true
+          cache-dir: ${{ env.TRIVY_CACHE_DIR }}
+          trivyignores: .trivyignore
+
+      - name: Run Trivy filesystem scan SARIF
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs-results.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: 0
+          ignore-unfixed: true
+          cache-dir: ${{ env.TRIVY_CACHE_DIR }}
+          trivyignores: .trivyignore
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: trivy-fs-results.sarif
+          category: trivy-filesystem
+
+      - name: Count findings by severity
+        id: counts
+        run: |
+          if [ ! -f trivy-fs-results.json ]; then
+            echo "No results file found"
+            echo "critical=0" >> $GITHUB_OUTPUT
+            echo "high=0"     >> $GITHUB_OUTPUT
+            echo "medium=0"   >> $GITHUB_OUTPUT
+            echo "pkgs_affected=0" >> $GITHUB_OUTPUT
+            echo "fixable=0"  >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CRITICAL=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' trivy-fs-results.json 2>/dev/null || echo "0")
+          HIGH=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity == "HIGH")] | length' trivy-fs-results.json 2>/dev/null || echo "0")
+          MEDIUM=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity == "MEDIUM")] | length' trivy-fs-results.json 2>/dev/null || echo "0")
+          PKGS_AFFECTED=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH") | .PkgName] | unique | length' trivy-fs-results.json 2>/dev/null || echo "0")
+          FIXABLE=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH") | select(.FixedVersion != null and .FixedVersion != "")] | length' trivy-fs-results.json 2>/dev/null || echo "0")
+
+          echo "critical=$CRITICAL"           >> $GITHUB_OUTPUT
+          echo "high=$HIGH"                   >> $GITHUB_OUTPUT
+          echo "medium=$MEDIUM"               >> $GITHUB_OUTPUT
+          echo "pkgs_affected=$PKGS_AFFECTED" >> $GITHUB_OUTPUT
+          echo "fixable=$FIXABLE"             >> $GITHUB_OUTPUT
+
+          echo "Findings: Critical=$CRITICAL High=$HIGH Medium=$MEDIUM"
+          echo "Packages affected: $PKGS_AFFECTED | Fixable: $FIXABLE"
+
+      - name: Print critical and high findings
+        if: always()
+        run: |
+          CRITICAL=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' trivy-fs-results.json 2>/dev/null || echo "0")
+          HIGH=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity == "HIGH")] | length' trivy-fs-results.json 2>/dev/null || echo "0")
+
+          if [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
+            echo "============================================"
+            echo "  Critical and High Vulnerabilities Found"
+            echo "  Fix these before merging"
+            echo "============================================"
+
+            jq -r '
+              .Results[] |
+              .Target as $target |
+              .Vulnerabilities[]? |
+              select(.Severity == "CRITICAL" or .Severity == "HIGH") |
+              "[\(.Severity)] \(.VulnerabilityID) - \(.PkgName) \(.InstalledVersion) - Fix: \(.FixedVersion // "No fix available") - \($target)"
+            ' trivy-fs-results.json | head -100
+          else
+            echo "No critical or high findings to display"
+          fi
+
+      - name: Evaluate security gate
+        id: gate
+        env:
+          CRITICAL: ${{ steps.counts.outputs.critical }}
+          HIGH: ${{ steps.counts.outputs.high }}
+        run: |
+          if [ -f ".security/thresholds.yml" ] && command -v yq &>/dev/null; then
+            CRIT_THRESH=$(yq '.dependencies.critical' .security/thresholds.yml)
+            HIGH_THRESH=$(yq '.dependencies.high'     .security/thresholds.yml)
+          else
+            CRIT_THRESH=0
+            HIGH_THRESH=5
+          fi
+
+          STATUS="pass"
+
+          if [ "${CRITICAL:-0}" -gt "$CRIT_THRESH" ]; then
+            STATUS="fail"
+            echo "::error::Critical vulnerabilities: $CRITICAL (threshold: $CRIT_THRESH)"
+          fi
+
+          if [ "${HIGH:-0}" -gt "$HIGH_THRESH" ]; then
+            STATUS="fail"
+            echo "::error::High vulnerabilities: $HIGH (threshold: $HIGH_THRESH)"
+          fi
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        env:
+          GATE_STATUS: ${{ steps.gate.outputs.status }}
+          CRITICAL: ${{ steps.counts.outputs.critical }}
+          HIGH: ${{ steps.counts.outputs.high }}
+          MEDIUM: ${{ steps.counts.outputs.medium }}
+          PKGS_AFFECTED: ${{ steps.counts.outputs.pkgs_affected }}
+          FIXABLE: ${{ steps.counts.outputs.fixable }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const gateStatus = process.env.GATE_STATUS;
+            const critical   = process.env.CRITICAL;
+            const high       = process.env.HIGH;
+            const medium     = process.env.MEDIUM;
+            const pkgs       = process.env.PKGS_AFFECTED;
+            const fixable    = process.env.FIXABLE;
+            const runUrl     = process.env.RUN_URL;
+
+            const lines = [];
+            lines.push('## Dependency Scan Results (Trivy)');
+            lines.push('');
+            lines.push('| Severity | Count |');
+            lines.push('|----------|-------|');
+            lines.push('| Critical | ' + critical + ' |');
+            lines.push('| High     | ' + high     + ' |');
+            lines.push('| Medium   | ' + medium   + ' |');
+            lines.push('');
+            lines.push('Packages affected (Critical/High): ' + pkgs);
+            lines.push('Fixable by upgrade: ' + fixable);
+            lines.push('');
+
+            if (gateStatus === 'fail') {
+              lines.push('### Merge Blocked');
+              lines.push('');
+              lines.push('Fix critical/high vulnerabilities before merging.');
+              lines.push('');
+              lines.push('Quick fixes:');
+              lines.push('- Run npm audit fix or pip install --upgrade package');
+              lines.push('- Check the workflow logs for specific package versions to upgrade');
+              lines.push('- If a fix is not available, add to .trivyignore with justification');
+            } else {
+              lines.push('### Gate Passed');
+              lines.push('');
+              lines.push('All dependency vulnerabilities are within configured thresholds.');
+            }
+
+            lines.push('');
+            lines.push('View full scan results: ' + runUrl);
+
+            const body = lines.join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Dependency Scan Results (Trivy)')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: trivy-fs-results-${{ github.run_number }}
+          path: |
+            trivy-fs-results.json
+            trivy-fs-results.sarif
+          retention-days: 30
+
+      - name: Enforce dependency security gate
+        env:
+          GATE_STATUS: ${{ steps.gate.outputs.status }}
+        run: |
+          if [ "$GATE_STATUS" == "fail" ]; then
+            echo "Dependency security gate FAILED"
+            echo "Fix the vulnerabilities listed above and re-run."
+            exit 1
+          fi
+          echo "Dependency security gate PASSED"
+
+  notify-daily-scan:
+    name: Notify Daily Scan Results
+    runs-on: ubuntu-latest
+    needs: trivy-fs-scan
+    if: always() && github.event_name == 'schedule'
+
+    steps:
+      - name: Notify Slack of daily scan results
+        if: secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.24.0
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+          GATE_STATUS: ${{ needs.trivy-fs-scan.outputs.gate_status }}
+          CRITICAL_COUNT: ${{ needs.trivy-fs-scan.outputs.critical_count }}
+          HIGH_COUNT: ${{ needs.trivy-fs-scan.outputs.high_count }}
+          MEDIUM_COUNT: ${{ needs.trivy-fs-scan.outputs.medium_count }}
+          REPO: ${{ github.repository }}
+        with:
+          payload: |
+            {
+              "text": "Daily Dependency Scan Complete",
+              "attachments": [
+                {
+                  "color": "${{ needs.trivy-fs-scan.outputs.gate_status == 'pass' && 'good' || 'danger' }}",
+                  "title": "Daily Trivy Scan: ${{ needs.trivy-fs-scan.outputs.gate_status }}",
+                  "fields": [
+                    {
+                      "title": "Repository",
+                      "value": "${{ github.repository }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Critical",
+                      "value": "${{ needs.trivy-fs-scan.outputs.critical_count }}",
+                      "short": true
+                    },
+                    {
+                      "title": "High",
+                      "value": "${{ needs.trivy-fs-scan.outputs.high_count }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Medium",
+                      "value": "${{ needs.trivy-fs-scan.outputs.medium_count }}",
+                      "short": true
+                    }
+                  ]
+                }
+              ]
+            }

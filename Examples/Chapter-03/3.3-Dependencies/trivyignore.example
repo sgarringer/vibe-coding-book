@@ -1,0 +1,60 @@
+# =============================================================================
+# .trivyignore - Trivy False Positive Suppressions
+# Book Reference: Chapter 3, Section 3.3.2.4 - Example 3.10
+# =============================================================================
+#
+# INSTRUCTIONS:
+#   1. Copy this file to your repository root as .trivyignore
+#   2. Replace example entries with your actual suppressions
+#   3. Every entry MUST have: reason, expiry date, and ticket reference
+#   4. Run quarterly review to remove expired entries
+#   5. Require security team approval for new entries via code review
+#
+# FORMAT:
+#   CVE-YYYY-NNNNN  # reason | expires: YYYY-MM-DD | ticket: TICKET-ID
+#
+# REVIEW SCHEDULE:
+#   Next review due: [DATE]
+#   Reviewer: [NAME]
+#   Last reviewed: [DATE]
+# =============================================================================
+
+# =============================================================================
+# Category 1: Not exploitable in our codebase
+# The vulnerable code path is never called
+# =============================================================================
+
+# CVE-2023-12345  # Not exploitable: vulnerable function xml.parseString() is
+#                 # never called. We only use xml.parse() which is unaffected.
+#                 # Verified by code search 2024-01-15.
+#                 # expires: 2024-07-01 | ticket: SEC-123
+
+# =============================================================================
+# Category 2: Mitigated by compensating control
+# A WAF, network policy, or other control prevents exploitation
+# =============================================================================
+
+# CVE-2023-67890  # Mitigated: WAF rule WAF-RULE-456 blocks the HTTP request
+#                 # pattern required for exploitation. Rule verified active
+#                 # in all environments on 2024-01-10.
+#                 # expires: 2024-04-01 | ticket: SEC-124
+
+# =============================================================================
+# Category 3: No fix available
+# Vendor has not released a patch - short expiry, check frequently
+# =============================================================================
+
+# CVE-2023-99999  # No fix available as of 2024-01-15. Upstream issue tracked
+#                 # at https://github.com/vendor/package/issues/999.
+#                 # Internal network only, not exposed to untrusted input.
+#                 # expires: 2024-02-15 | ticket: SEC-125
+
+# =============================================================================
+# Category 4: Accepted risk (requires security team written approval)
+# =============================================================================
+
+# CVE-2022-88888  # Accepted risk: CVSS 3.1 score 4.2 (Medium). Requires
+#                 # physical access to exploit. Not applicable to our
+#                 # cloud-hosted deployment model.
+#                 # Approved by: security-lead@company.com on 2024-01-01
+#                 # expires: 2024-07-01 | ticket: SEC-126

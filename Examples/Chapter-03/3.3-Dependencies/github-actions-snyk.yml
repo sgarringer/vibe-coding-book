@@ -1,0 +1,253 @@
+# =============================================================================
+# GitHub Actions - Dependency Scanning with Snyk
+# Book Reference: Chapter 3, Section 3.3.2.2
+# =============================================================================
+# Features demonstrated:
+#   - Multi-language support
+#   - SARIF upload for GitHub Security tab
+#   - Fix PR generation
+# =============================================================================
+#
+# SETUP REQUIRED:
+#   1. Create a Snyk account at https://snyk.io (free tier available)
+#   2. Get your API token: Snyk Dashboard > Account Settings > API Token
+#   3. Add SNYK_TOKEN secret to your GitHub repository
+#      Settings > Secrets > Actions > New repository secret
+#
+# SNYK FREE TIER LIMITS:
+#   - 200 tests/month for open source
+#   - Unlimited for public repositories
+#   - Fix PRs: up to 5/month on free tier
+# =============================================================================
+
+name: Dependency Scan - Snyk
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 6 * * *'    # Daily at 6am UTC
+
+jobs:
+
+  snyk-scan:
+    name: Snyk Dependency Scan
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents:        read
+      security-events: write
+      pull-requests:   write
+
+    outputs:
+      critical_count: ${{ steps.counts.outputs.critical }}
+      high_count:     ${{ steps.counts.outputs.high }}
+      gate_status:    ${{ steps.gate.outputs.status }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # -----------------------------------------------------------------------
+      # Snyk test - outputs JSON for processing
+      # --all-projects: scans all package manifests in the repo
+      # --json-file-output: saves results without affecting exit code
+      # -----------------------------------------------------------------------
+      - name: Run Snyk dependency scan
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: >-
+            --all-projects
+            --severity-threshold=medium
+            --json-file-output=snyk-results.json
+
+      # -----------------------------------------------------------------------
+      # Upload SARIF to GitHub Security tab
+      # Snyk can generate SARIF directly
+      # -----------------------------------------------------------------------
+      - name: Generate Snyk SARIF
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: >-
+            --all-projects
+            --sarif-file-output=snyk-results.sarif
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: snyk-results.sarif
+          category:   snyk
+
+      # -----------------------------------------------------------------------
+      # Count findings
+      # Snyk JSON format differs from Trivy - parse accordingly
+      # -----------------------------------------------------------------------
+      - name: Count findings by severity
+        id: counts
+        run: |
+          if [ ! -f snyk-results.json ]; then
+            echo "No Snyk results file found"
+            echo "critical=0" >> $GITHUB_OUTPUT
+            echo "high=0"     >> $GITHUB_OUTPUT
+            echo "medium=0"   >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Snyk outputs an array when --all-projects is used
+          # Handle both single object and array formats
+          IS_ARRAY=$(jq 'if type == "array" then "true" else "false" end' \
+            snyk-results.json)
+
+          if [ "$IS_ARRAY" == '"true"' ]; then
+            CRITICAL=$(jq '[.[].vulnerabilities[]? |
+              select(.severity == "critical")] | length' \
+              snyk-results.json 2>/dev/null || echo "0")
+            HIGH=$(jq '[.[].vulnerabilities[]? |
+              select(.severity == "high")] | length' \
+              snyk-results.json 2>/dev/null || echo "0")
+            MEDIUM=$(jq '[.[].vulnerabilities[]? |
+              select(.severity == "medium")] | length' \
+              snyk-results.json 2>/dev/null || echo "0")
+          else
+            CRITICAL=$(jq '[.vulnerabilities[]? |
+              select(.severity == "critical")] | length' \
+              snyk-results.json 2>/dev/null || echo "0")
+            HIGH=$(jq '[.vulnerabilities[]? |
+              select(.severity == "high")] | length' \
+              snyk-results.json 2>/dev/null || echo "0")
+            MEDIUM=$(jq '[.vulnerabilities[]? |
+              select(.severity == "medium")] | length' \
+              snyk-results.json 2>/dev/null || echo "0")
+          fi
+
+          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "high=$HIGH"         >> $GITHUB_OUTPUT
+          echo "medium=$MEDIUM"     >> $GITHUB_OUTPUT
+
+          echo "Snyk findings: Critical=$CRITICAL High=$HIGH Medium=$MEDIUM"
+
+      # -----------------------------------------------------------------------
+      # Generate fix PR for critical/high vulnerabilities
+      # Snyk can automatically create PRs with dependency upgrades
+      # -----------------------------------------------------------------------
+      - name: Generate Snyk fix PR
+        if: |
+          github.event_name == 'schedule' &&
+          (steps.counts.outputs.critical != '0' ||
+           steps.counts.outputs.high != '0')
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          command: fix
+          args: >-
+            --all-projects
+            --pr-title="fix: Snyk security fixes"
+
+      - name: Evaluate security gate
+        id: gate
+        run: |
+          CRITICAL="${{ steps.counts.outputs.critical }}"
+          HIGH="${{     steps.counts.outputs.high }}"
+
+          if [ -f ".security/thresholds.yml" ] && command -v yq &>/dev/null; then
+            CRIT_THRESH=$(yq '.dependencies.critical' .security/thresholds.yml)
+            HIGH_THRESH=$(yq '.dependencies.high'     .security/thresholds.yml)
+          else
+            CRIT_THRESH=0
+            HIGH_THRESH=5
+          fi
+
+          STATUS="pass"
+          [ "$CRITICAL" -gt "$CRIT_THRESH" ] && STATUS="fail"
+          [ "$HIGH"     -gt "$HIGH_THRESH"  ] && STATUS="fail"
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const gateStatus = '${{ steps.gate.outputs.status }}';
+            const critical   = '${{ steps.counts.outputs.critical }}';
+            const high       = '${{ steps.counts.outputs.high }}';
+            const medium     = '${{ steps.counts.outputs.medium }}';
+            const runUrl     = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
+
+            const lines = [];
+            lines.push('## Dependency Scan Results (Snyk)');
+            lines.push('');
+            lines.push('| Severity | Count |');
+            lines.push('|----------|-------|');
+            lines.push('| Critical | ' + critical + ' |');
+            lines.push('| High     | ' + high     + ' |');
+            lines.push('| Medium   | ' + medium   + ' |');
+            lines.push('');
+
+            if (gateStatus === 'fail') {
+              lines.push('### Merge Blocked');
+              lines.push('');
+              lines.push('Fix critical/high vulnerabilities before merging.');
+              lines.push('Run `snyk wizard` locally for guided remediation.');
+            } else {
+              lines.push('### Gate Passed');
+            }
+
+            lines.push('');
+            lines.push('[View full results](' + runUrl + ')');
+
+            const body = lines.join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Dependency Scan Results (Snyk)')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Upload Snyk artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: snyk-results-${{ github.run_number }}
+          path: |
+            snyk-results.json
+            snyk-results.sarif
+          retention-days: 30
+
+      - name: Enforce gate
+        run: |
+          [ "${{ steps.gate.outputs.status }}" == "fail" ] && exit 1 || exit 0

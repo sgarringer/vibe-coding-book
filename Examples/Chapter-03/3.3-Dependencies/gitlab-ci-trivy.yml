@@ -1,0 +1,234 @@
+# =============================================================================
+# GitLab CI - Dependency Scanning with Trivy
+# Book Reference: Chapter 3, Section 3.3.2.2
+# =============================================================================
+# Features demonstrated:
+#   - Dependency scanning report (GitLab Security Dashboard)
+#   - Container scanning
+#   - License compliance
+# =============================================================================
+
+variables:
+  TRIVY_VERSION:    "0.48.0"
+  TRIVY_CACHE_DIR:  ".trivy-cache"
+  BREAK_SEVERITY:   "CRITICAL,HIGH"
+  REPORT_SEVERITY:  "CRITICAL,HIGH,MEDIUM"
+  ARTIFACT_EXPIRE:  "30 days"
+
+stages:
+  - scan
+  - report
+
+# =============================================================================
+# Dependency scan - filesystem
+# =============================================================================
+
+trivy-dependency-scan:
+  stage: scan
+  image:
+    name: aquasec/trivy:$TRIVY_VERSION
+    entrypoint: [""]
+
+  cache:
+    key: trivy-db
+    paths:
+      - $TRIVY_CACHE_DIR
+
+  script:
+    # -------------------------------------------------------------------------
+    # Filesystem scan - application dependencies
+    # -------------------------------------------------------------------------
+    - |
+      trivy fs \
+        --cache-dir "$TRIVY_CACHE_DIR" \
+        --format json \
+        --output trivy-dep-results.json \
+        --severity "$REPORT_SEVERITY" \
+        --exit-code 0 \
+        --ignore-unfixed \
+        $([ -f .trivyignore ] && echo "--ignorefile .trivyignore") \
+        .
+
+    # -------------------------------------------------------------------------
+    # Generate GitLab dependency scanning report format
+    # This populates the GitLab Security Dashboard (Ultimate tier)
+    # -------------------------------------------------------------------------
+    - |
+      trivy fs \
+        --cache-dir "$TRIVY_CACHE_DIR" \
+        --format template \
+        --template "@/contrib/gitlab.tpl" \
+        --output gl-dependency-scanning-report.json \
+        --severity "$REPORT_SEVERITY" \
+        --exit-code 0 \
+        --ignore-unfixed \
+        .
+
+    # -------------------------------------------------------------------------
+    # Count and evaluate thresholds
+    # -------------------------------------------------------------------------
+    - |
+      CRITICAL=$(jq '[.Results[].Vulnerabilities[]? |
+        select(.Severity == "CRITICAL")] | length' \
+        trivy-dep-results.json 2>/dev/null || echo "0")
+      HIGH=$(jq '[.Results[].Vulnerabilities[]? |
+        select(.Severity == "HIGH")] | length' \
+        trivy-dep-results.json 2>/dev/null || echo "0")
+      MEDIUM=$(jq '[.Results[].Vulnerabilities[]? |
+        select(.Severity == "MEDIUM")] | length' \
+        trivy-dep-results.json 2>/dev/null || echo "0")
+
+      echo "Dependency scan: Critical=$CRITICAL High=$HIGH Medium=$MEDIUM"
+      echo "DEP_CRITICAL=$CRITICAL" >> dep-counts.env
+      echo "DEP_HIGH=$HIGH"         >> dep-counts.env
+      echo "DEP_MEDIUM=$MEDIUM"     >> dep-counts.env
+
+      # Fail on critical or high above threshold
+      if [ "$CRITICAL" -gt 0 ]; then
+        echo "Critical vulnerabilities found: $CRITICAL"
+        exit 1
+      fi
+
+  artifacts:
+    reports:
+      dependency_scanning: gl-dependency-scanning-report.json
+      dotenv: dep-counts.env
+    paths:
+      - trivy-dep-results.json
+      - gl-dependency-scanning-report.json
+      - dep-counts.env
+    when: always
+    expire_in: $ARTIFACT_EXPIRE
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
+# =============================================================================
+# Container scan
+# Scans the Docker image built by the pipeline
+# =============================================================================
+
+trivy-container-scan:
+  stage: scan
+  image:
+    name: aquasec/trivy:$TRIVY_VERSION
+    entrypoint: [""]
+
+  # Only run if a Dockerfile exists
+  rules:
+    - exists:
+        - Dockerfile
+        - docker/Dockerfile
+        - '**/Dockerfile'
+      when: always
+    - when: never
+
+  variables:
+    # Set this to your image name - override in project CI/CD variables
+    CONTAINER_IMAGE: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+
+  before_script:
+    # Login to registry to pull the image
+    - trivy image --download-db-only --cache-dir "$TRIVY_CACHE_DIR"
+
+  script:
+    - |
+      trivy image \
+        --cache-dir "$TRIVY_CACHE_DIR" \
+        --format json \
+        --output trivy-container-results.json \
+        --severity "$REPORT_SEVERITY" \
+        --exit-code 0 \
+        --ignore-unfixed \
+        "$CONTAINER_IMAGE" || true
+
+    - |
+      trivy image \
+        --cache-dir "$TRIVY_CACHE_DIR" \
+        --format template \
+        --template "@/contrib/gitlab.tpl" \
+        --output gl-container-scanning-report.json \
+        --severity "$REPORT_SEVERITY" \
+        --exit-code 0 \
+        "$CONTAINER_IMAGE" || true
+
+    - |
+      CRITICAL=$(jq '[.Results[].Vulnerabilities[]? |
+        select(.Severity == "CRITICAL")] | length' \
+        trivy-container-results.json 2>/dev/null || echo "0")
+      HIGH=$(jq '[.Results[].Vulnerabilities[]? |
+        select(.Severity == "HIGH")] | length' \
+        trivy-container-results.json 2>/dev/null || echo "0")
+
+      echo "Container scan: Critical=$CRITICAL High=$HIGH"
+
+      [ "$CRITICAL" -gt 0 ] && exit 1 || exit 0
+
+  artifacts:
+    reports:
+      container_scanning: gl-container-scanning-report.json
+    paths:
+      - trivy-container-results.json
+      - gl-container-scanning-report.json
+    when: always
+    expire_in: $ARTIFACT_EXPIRE
+
+# =============================================================================
+# License compliance scan
+# Ensures dependencies use approved licenses
+# =============================================================================
+
+trivy-license-scan:
+  stage: scan
+  image:
+    name: aquasec/trivy:$TRIVY_VERSION
+    entrypoint: [""]
+
+  variables:
+    # Licenses that are NOT allowed in your project
+    # Adjust based on your legal requirements
+    FORBIDDEN_LICENSES: "GPL-2.0,GPL-3.0,AGPL-3.0,LGPL-2.1"
+
+  script:
+    - |
+      trivy fs \
+        --cache-dir "$TRIVY_CACHE_DIR" \
+        --scanners license \
+        --format json \
+        --output trivy-license-results.json \
+        --exit-code 0 \
+        .
+
+    - |
+      # Check for forbidden licenses
+      FORBIDDEN_COUNT=0
+      for LICENSE in $(echo "$FORBIDDEN_LICENSES" | tr ',' ' '); do
+        COUNT=$(jq --arg lic "$LICENSE" \
+          '[.Results[].Licenses[]? |
+           select(.Name == $lic)] | length' \
+          trivy-license-results.json 2>/dev/null || echo "0")
+        if [ "$COUNT" -gt 0 ]; then
+          echo "Found $COUNT package(s) with forbidden license: $LICENSE"
+          FORBIDDEN_COUNT=$((FORBIDDEN_COUNT + COUNT))
+        fi
+      done
+
+      if [ "$FORBIDDEN_COUNT" -gt 0 ]; then
+        echo "License compliance FAILED: $FORBIDDEN_COUNT forbidden license(s)"
+        exit 1
+      fi
+
+      echo "License compliance PASSED"
+
+  artifacts:
+    paths:
+      - trivy-license-results.json
+    when: always
+    expire_in: $ARTIFACT_EXPIRE
+
+  allow_failure: true    # License scan warns but doesn't block by default
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'

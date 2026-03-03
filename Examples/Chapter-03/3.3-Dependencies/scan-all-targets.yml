@@ -1,0 +1,535 @@
+# =============================================================================
+# GitHub Actions - Scan All Targets
+# Book Reference: Chapter 3, Section 3.3.2.3 - Example 3.9
+# =============================================================================
+# Demonstrates scanning all four target types from Section 3.3.2.3:
+#   1. Application dependencies (package.json, requirements.txt, etc.)
+#   2. Container base images
+#   3. Infrastructure as Code (Terraform, CloudFormation)
+#   4. CI/CD dependencies (GitHub Actions)
+# =============================================================================
+
+name: Scan All Targets
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 1 * * *'    # Daily at 1am UTC
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Target 1: Application dependencies
+  # Scans package manifests for vulnerable libraries
+  # Covers: npm, pip, go, maven, gradle, composer, gems, cargo, etc.
+  # ---------------------------------------------------------------------------
+  scan-application-deps:
+    name: "Target 1: Application Dependencies"
+    runs-on: ubuntu-latest
+
+    outputs:
+      critical: ${{ steps.counts.outputs.critical }}
+      high:     ${{ steps.counts.outputs.high }}
+      status:   ${{ steps.gate.outputs.status }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Scan application dependencies
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type:      'fs'
+          scan-ref:       '.'
+          format:         'json'
+          output:         'deps-results.json'
+          severity:       'CRITICAL,HIGH,MEDIUM'
+          exit-code:      '0'
+          ignore-unfixed: true
+          trivyignores:   '.trivyignore'
+
+      - name: Count findings
+        id: counts
+        run: |
+          CRITICAL=$(jq '[.Results[].Vulnerabilities[]? |
+            select(.Severity == "CRITICAL")] | length' \
+            deps-results.json 2>/dev/null || echo "0")
+          HIGH=$(jq '[.Results[].Vulnerabilities[]? |
+            select(.Severity == "HIGH")] | length' \
+            deps-results.json 2>/dev/null || echo "0")
+          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "high=$HIGH"         >> $GITHUB_OUTPUT
+          echo "Application deps: Critical=$CRITICAL High=$HIGH"
+
+      - name: Evaluate gate
+        id: gate
+        run: |
+          C="${{ steps.counts.outputs.critical }}"
+          H="${{ steps.counts.outputs.high }}"
+          STATUS="pass"
+          [ "$C" -gt 0 ] && STATUS="fail"
+          [ "$H" -gt 5 ] && STATUS="fail"
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: Upload results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: deps-results-${{ github.run_number }}
+          path: deps-results.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Target 2: Container base images
+  # Scans Docker images referenced in Dockerfiles
+  # Catches OS-level vulnerabilities in base images
+  # ---------------------------------------------------------------------------
+  scan-container-images:
+    name: "Target 2: Container Base Images"
+    runs-on: ubuntu-latest
+
+    # Only run if Dockerfiles exist
+    outputs:
+      critical: ${{ steps.counts.outputs.critical }}
+      high:     ${{ steps.counts.outputs.high }}
+      status:   ${{ steps.gate.outputs.status }}
+      skipped:  ${{ steps.check.outputs.skipped }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Check for Dockerfiles
+        id: check
+        run: |
+          if find . -name "Dockerfile*" -not -path "./.git/*" | grep -q .; then
+            echo "skipped=false" >> $GITHUB_OUTPUT
+            echo "Dockerfiles found - will scan base images"
+          else
+            echo "skipped=true" >> $GITHUB_OUTPUT
+            echo "No Dockerfiles found - skipping container scan"
+          fi
+
+      - name: Extract base images from Dockerfiles
+        if: steps.check.outputs.skipped == 'false'
+        id: images
+        run: |
+          # Extract all FROM directives (excluding ARG-based and scratch)
+          IMAGES=$(find . -name "Dockerfile*" -not -path "./.git/*" \
+            -exec grep -h "^FROM" {} \; | \
+            grep -v "scratch" | \
+            grep -v "ARG " | \
+            awk '{print $2}' | \
+            grep -v "^--" | \
+            sort -u | \
+            tr '\n' ' ')
+
+          echo "Found base images: $IMAGES"
+          echo "images=$IMAGES" >> $GITHUB_OUTPUT
+
+      - name: Scan container base images
+        if: steps.check.outputs.skipped == 'false'
+        run: |
+          TOTAL_CRITICAL=0
+          TOTAL_HIGH=0
+
+          for IMAGE in ${{ steps.images.outputs.images }}; do
+            echo "Scanning image: $IMAGE"
+
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              aquasec/trivy:latest \
+              image \
+                --format json \
+                --output "/tmp/container-${IMAGE//\//-}.json" \
+                --severity CRITICAL,HIGH,MEDIUM \
+                --exit-code 0 \
+                --ignore-unfixed \
+                "$IMAGE" || true
+
+            if [ -f "/tmp/container-${IMAGE//\//-}.json" ]; then
+              C=$(jq '[.Results[].Vulnerabilities[]? |
+                select(.Severity == "CRITICAL")] | length' \
+                "/tmp/container-${IMAGE//\//-}.json" 2>/dev/null || echo "0")
+              H=$(jq '[.Results[].Vulnerabilities[]? |
+                select(.Severity == "HIGH")] | length' \
+                "/tmp/container-${IMAGE//\//-}.json" 2>/dev/null || echo "0")
+
+              echo "  $IMAGE: Critical=$C High=$H"
+              TOTAL_CRITICAL=$((TOTAL_CRITICAL + C))
+              TOTAL_HIGH=$((TOTAL_HIGH + H))
+
+              cp "/tmp/container-${IMAGE//\//-}.json" \
+                 "container-scan-${IMAGE//\//-}.json"
+            fi
+          done
+
+          echo "CONTAINER_CRITICAL=$TOTAL_CRITICAL" >> $GITHUB_ENV
+          echo "CONTAINER_HIGH=$TOTAL_HIGH"         >> $GITHUB_ENV
+
+      - name: Count findings
+        id: counts
+        run: |
+          C="${CONTAINER_CRITICAL:-0}"
+          H="${CONTAINER_HIGH:-0}"
+          echo "critical=$C" >> $GITHUB_OUTPUT
+          echo "high=$H"     >> $GITHUB_OUTPUT
+
+      - name: Evaluate gate
+        id: gate
+        run: |
+          C="${{ steps.counts.outputs.critical }}"
+          H="${{ steps.counts.outputs.high }}"
+          STATUS="pass"
+          [ "$C" -gt 0 ] && STATUS="fail"
+          [ "$H" -gt 5 ] && STATUS="fail"
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: Upload container scan results
+        uses: actions/upload-artifact@v3
+        if: always() && steps.check.outputs.skipped == 'false'
+        with:
+          name: container-scan-results-${{ github.run_number }}
+          path: container-scan-*.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Target 3: Infrastructure as Code
+  # Scans Terraform, CloudFormation, Kubernetes manifests for misconfigurations
+  # ---------------------------------------------------------------------------
+  scan-iac:
+    name: "Target 3: Infrastructure as Code"
+    runs-on: ubuntu-latest
+
+    outputs:
+      critical: ${{ steps.counts.outputs.critical }}
+      high:     ${{ steps.counts.outputs.high }}
+      status:   ${{ steps.gate.outputs.status }}
+      skipped:  ${{ steps.check.outputs.skipped }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Check for IaC files
+        id: check
+        run: |
+          IAC_FOUND=false
+          IAC_DIRS=""
+
+          # Check for common IaC directories and files
+          for DIR in terraform infra infrastructure k8s kubernetes helm charts; do
+            if [ -d "$DIR" ]; then
+              IAC_FOUND=true
+              IAC_DIRS="$IAC_DIRS $DIR"
+            fi
+          done
+
+          # Check for CloudFormation templates
+          if find . -name "*.template" -o -name "cloudformation*.yml" \
+             -not -path "./.git/*" 2>/dev/null | grep -q .; then
+            IAC_FOUND=true
+          fi
+
+          if [ "$IAC_FOUND" == "true" ]; then
+            echo "skipped=false" >> $GITHUB_OUTPUT
+            echo "iac_dirs=$IAC_DIRS" >> $GITHUB_OUTPUT
+            echo "IaC found in: $IAC_DIRS"
+          else
+            echo "skipped=true" >> $GITHUB_OUTPUT
+            echo "No IaC files found - skipping IaC scan"
+          fi
+
+      - name: Scan IaC configurations
+        if: steps.check.outputs.skipped == 'false'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type:  'config'
+          scan-ref:   '.'
+          format:     'json'
+          output:     'iac-results.json'
+          severity:   'CRITICAL,HIGH,MEDIUM'
+          exit-code:  '0'
+
+      - name: Count IaC findings
+        id: counts
+        if: steps.check.outputs.skipped == 'false'
+        run: |
+          CRITICAL=$(jq '[.Results[].Misconfigurations[]? |
+            select(.Severity == "CRITICAL")] | length' \
+            iac-results.json 2>/dev/null || echo "0")
+          HIGH=$(jq '[.Results[].Misconfigurations[]? |
+            select(.Severity == "HIGH")] | length' \
+            iac-results.json 2>/dev/null || echo "0")
+          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "high=$HIGH"         >> $GITHUB_OUTPUT
+          echo "IaC: Critical=$CRITICAL High=$HIGH"
+
+      - name: Set skipped counts
+        id: counts-skipped
+        if: steps.check.outputs.skipped == 'true'
+        run: |
+          echo "critical=0" >> $GITHUB_OUTPUT
+          echo "high=0"     >> $GITHUB_OUTPUT
+
+      - name: Evaluate gate
+        id: gate
+        run: |
+          C="${{ steps.counts.outputs.critical || steps.counts-skipped.outputs.critical }}"
+          H="${{ steps.counts.outputs.high     || steps.counts-skipped.outputs.high }}"
+          STATUS="pass"
+          [ "${C:-0}" -gt 0 ] && STATUS="fail"
+          [ "${H:-0}" -gt 5 ] && STATUS="fail"
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: Upload IaC results
+        uses: actions/upload-artifact@v3
+        if: always() && steps.check.outputs.skipped == 'false'
+        with:
+          name: iac-results-${{ github.run_number }}
+          path: iac-results.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Target 4: CI/CD dependencies
+  # Scans GitHub Actions workflow files for pinning and known vulnerabilities
+  # ---------------------------------------------------------------------------
+  scan-cicd-deps:
+    name: "Target 4: CI/CD Dependencies"
+    runs-on: ubuntu-latest
+
+    outputs:
+      issues_found: ${{ steps.scan.outputs.issues_found }}
+      status:       ${{ steps.gate.outputs.status }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Scan GitHub Actions for unpinned versions
+        id: scan
+        run: |
+          ISSUES=0
+          UNPINNED_ACTIONS=""
+
+          # Find all workflow files
+          WORKFLOW_FILES=$(find .github/workflows -name "*.yml" -o -name "*.yaml" \
+            2>/dev/null || echo "")
+
+          if [ -z "$WORKFLOW_FILES" ]; then
+            echo "No workflow files found"
+            echo "issues_found=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Checking GitHub Actions for security issues..."
+          echo ""
+
+          for WORKFLOW in $WORKFLOW_FILES; do
+            echo "Checking: $WORKFLOW"
+
+            # Check for actions using branch references instead of SHA pins
+            # Branch refs (e.g., @main, @master, @v1) can be hijacked
+            # SHA pins (e.g., @abc123def) are immutable
+            UNPINNED=$(grep -n "uses:" "$WORKFLOW" | \
+              grep -v "@[a-f0-9]\{40\}" | \
+              grep -v "^#" || true)
+
+            if [ -n "$UNPINNED" ]; then
+              echo "  WARNING: Unpinned actions found in $WORKFLOW:"
+              echo "$UNPINNED" | while read -r line; do
+                echo "    Line $line"
+                ISSUES=$((ISSUES + 1))
+              done
+            fi
+
+            # Check for actions using @master or @main (mutable refs)
+            MUTABLE=$(grep -n "uses:.*@\(main\|master\)" "$WORKFLOW" || true)
+            if [ -n "$MUTABLE" ]; then
+              echo "  ERROR: Actions pinned to mutable branch refs:"
+              echo "$MUTABLE"
+              ISSUES=$((ISSUES + 1))
+            fi
+
+            # Check for third-party actions without verification
+            THIRD_PARTY=$(grep -n "uses:" "$WORKFLOW" | \
+              grep -v "actions/" | \
+              grep -v "github/" | \
+              grep -v "^#" || true)
+
+            if [ -n "$THIRD_PARTY" ] && [ "$VERBOSE" == "true" ]; then
+              echo "  INFO: Third-party actions (review manually):"
+              echo "$THIRD_PARTY"
+            fi
+          done
+
+          echo ""
+          
+          echo "CI/CD dependency scan complete. Issues found: $ISSUES"
+          echo "issues_found=$ISSUES" >> $GITHUB_OUTPUT
+
+      - name: Evaluate gate
+        id: gate
+        run: |
+          ISSUES="${{ steps.scan.outputs.issues_found }}"
+          STATUS="pass"
+
+          # Mutable action refs are a supply chain risk
+          # Any unpinned actions in production workflows should block
+          if [ "${ISSUES:-0}" -gt 0 ]; then
+            STATUS="warn"    # Warn but don't block - teams need time to pin
+            echo "::warning::$ISSUES unpinned GitHub Actions found"
+            echo "Pin actions to full commit SHAs to prevent supply chain attacks"
+            echo "Example: uses: actions/checkout@v3"
+            echo "Becomes: uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744"
+          fi
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # Aggregator: Combine all scan results into unified report
+  # ---------------------------------------------------------------------------
+  scan-summary:
+    name: "All Targets - Summary"
+    runs-on: ubuntu-latest
+    needs:
+      - scan-application-deps
+      - scan-container-images
+      - scan-iac
+      - scan-cicd-deps
+    if: always()
+
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Evaluate overall gate
+        id: overall
+        run: |
+          DEP_STATUS="${{       needs.scan-application-deps.outputs.status }}"
+          CONTAINER_STATUS="${{ needs.scan-container-images.outputs.status }}"
+          IAC_STATUS="${{       needs.scan-iac.outputs.status }}"
+
+          OVERALL="pass"
+          [ "$DEP_STATUS"       == "fail" ] && OVERALL="fail"
+          [ "$CONTAINER_STATUS" == "fail" ] && OVERALL="fail"
+          [ "$IAC_STATUS"       == "fail" ] && OVERALL="fail"
+
+          echo "status=$OVERALL" >> $GITHUB_OUTPUT
+          echo "Overall scan status: $OVERALL"
+
+      - name: Write step summary
+        run: |
+          STATUS="${{ steps.overall.outputs.status }}"
+          ICON="PASSED"
+          [ "$STATUS" == "fail" ] && ICON="FAILED"
+
+          echo "## Scan All Targets - $ICON" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Target | Critical | High | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|----------|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Application Dependencies | ${{ needs.scan-application-deps.outputs.critical }} | ${{ needs.scan-application-deps.outputs.high }} | ${{ needs.scan-application-deps.outputs.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Container Images | ${{ needs.scan-container-images.outputs.critical }} | ${{ needs.scan-container-images.outputs.high }} | ${{ needs.scan-container-images.outputs.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Infrastructure as Code | ${{ needs.scan-iac.outputs.critical }} | ${{ needs.scan-iac.outputs.high }} | ${{ needs.scan-iac.outputs.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| CI/CD Dependencies | - | - | ${{ needs.scan-cicd-deps.outputs.status }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const overallStatus  = '${{ steps.overall.outputs.status }}';
+            const depCrit        = '${{ needs.scan-application-deps.outputs.critical }}';
+            const depHigh        = '${{ needs.scan-application-deps.outputs.high }}';
+            const depStatus      = '${{ needs.scan-application-deps.outputs.status }}';
+            const containerCrit  = '${{ needs.scan-container-images.outputs.critical }}';
+            const containerHigh  = '${{ needs.scan-container-images.outputs.high }}';
+            const containerStatus = '${{ needs.scan-container-images.outputs.status }}';
+            const containerSkip  = '${{ needs.scan-container-images.outputs.skipped }}';
+            const iacCrit        = '${{ needs.scan-iac.outputs.critical }}';
+            const iacHigh        = '${{ needs.scan-iac.outputs.high }}';
+            const iacStatus      = '${{ needs.scan-iac.outputs.status }}';
+            const iacSkip        = '${{ needs.scan-iac.outputs.skipped }}';
+            const cicdIssues     = '${{ needs.scan-cicd-deps.outputs.issues_found }}';
+            const cicdStatus     = '${{ needs.scan-cicd-deps.outputs.status }}';
+            const runUrl         = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
+
+            const statusLabel = (s) => s === 'pass' ? 'PASS' : s === 'warn' ? 'WARN' : s === 'skip' ? 'SKIP' : 'FAIL';
+
+            const lines = [];
+            lines.push('## Dependency Scan - All Targets (Example 3.9)');
+            lines.push('');
+            lines.push('| Target | Critical | High | Status |');
+            lines.push('|--------|----------|------|--------|');
+            lines.push('| Application Dependencies | ' + depCrit + ' | ' + depHigh + ' | ' + statusLabel(depStatus) + ' |');
+
+            if (containerSkip === 'true') {
+              lines.push('| Container Images | - | - | SKIP (no Dockerfiles) |');
+            } else {
+              lines.push('| Container Images | ' + containerCrit + ' | ' + containerHigh + ' | ' + statusLabel(containerStatus) + ' |');
+            }
+
+            if (iacSkip === 'true') {
+              lines.push('| Infrastructure as Code | - | - | SKIP (no IaC files) |');
+            } else {
+              lines.push('| Infrastructure as Code | ' + iacCrit + ' | ' + iacHigh + ' | ' + statusLabel(iacStatus) + ' |');
+            }
+
+            lines.push('| CI/CD Dependencies | - | ' + cicdIssues + ' unpinned | ' + statusLabel(cicdStatus) + ' |');
+            lines.push('');
+
+            if (overallStatus === 'fail') {
+              lines.push('### Merge Blocked');
+              lines.push('');
+              lines.push('One or more scan targets have critical or high vulnerabilities.');
+              lines.push('Review the workflow logs for specific packages and remediation steps.');
+            } else {
+              lines.push('### All Targets Passed');
+              lines.push('');
+              lines.push('No critical or high vulnerabilities found across all scan targets.');
+            }
+
+            lines.push('');
+            lines.push('[View full scan results](' + runUrl + ')');
+
+            const body = lines.join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Scan All Targets')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Enforce overall gate
+        run: |
+          STATUS="${{ steps.overall.outputs.status }}"
+          if [ "$STATUS" == "fail" ]; then
+            echo "One or more scan targets FAILED - merge blocked"
+            exit 1
+          fi
+          echo "All scan targets PASSED"

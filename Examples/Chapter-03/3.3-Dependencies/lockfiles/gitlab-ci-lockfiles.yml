@@ -1,0 +1,118 @@
+# =============================================================================
+# Lockfile Enforcement - GitLab CI
+# Book Reference: Chapter 3, Section 3.3.7.2
+# =============================================================================
+# GitLab CI equivalents of the GitHub Actions lockfile enforcement workflow.
+# Implements Table 3.10 correct install commands for each ecosystem.
+# =============================================================================
+
+variables:
+  NODE_VERSION:   "18"
+  PYTHON_VERSION: "3.11"
+  GO_VERSION:     "1.21"
+
+stages:
+  - lockfile-check
+
+.lockfile-rules:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+nodejs-lockfile-check:
+  stage: lockfile-check
+  image: node:$NODE_VERSION
+  extends: .lockfile-rules
+  rules:
+    - exists:
+        - package.json
+      when: always
+    - when: never
+  script:
+    - |
+      if [ ! -f package-lock.json ] && [ ! -f yarn.lock ] && [ ! -f pnpm-lock.yaml ]; then
+        echo "ERROR: No lockfile found for package.json"
+        echo "Run 'npm install' to generate package-lock.json"
+        exit 1
+      fi
+
+    - |
+      if [ -f package-lock.json ]; then
+        echo "Running: npm ci (Table 3.10)"
+        npm ci --prefer-offline
+        echo "npm ci succeeded - lockfile is in sync"
+      elif [ -f yarn.lock ]; then
+        echo "Running: yarn install --frozen-lockfile (Table 3.10)"
+        yarn install --frozen-lockfile
+      elif [ -f pnpm-lock.yaml ]; then
+        echo "Running: pnpm install --frozen-lockfile (Table 3.10)"
+        npm install -g pnpm
+        pnpm install --frozen-lockfile
+      fi
+
+python-lockfile-check:
+  stage: lockfile-check
+  image: python:$PYTHON_VERSION
+  extends: .lockfile-rules
+  rules:
+    - exists:
+        - requirements*.txt
+        - poetry.lock
+      when: always
+    - when: never
+  script:
+    - |
+      REQ_FILES=$(find . -name "requirements*.txt" -not -path "./.git/*" | head -5)
+
+      for REQ_FILE in $REQ_FILES; do
+        HAS_HASHES=$(grep -c " --hash=" "$REQ_FILE" 2>/dev/null || echo "0")
+
+        if [ "$HAS_HASHES" -gt 0 ]; then
+          echo "Installing with hash verification (Table 3.10):"
+          echo "pip install --require-hashes -r $REQ_FILE"
+          pip install --require-hashes -r "$REQ_FILE" --quiet
+          echo "Hash verification passed for $REQ_FILE"
+        else
+          echo "WARNING: $REQ_FILE has no hashes"
+          echo "Generate with: pip-compile --generate-hashes"
+          pip install -r "$REQ_FILE" --quiet
+        fi
+      done
+
+    - |
+      if [ -f poetry.lock ]; then
+        pip install poetry --quiet
+        echo "Running: poetry install --no-update (Table 3.10)"
+        poetry install --no-update
+        poetry check --lock
+        echo "poetry.lock is in sync"
+      fi
+
+go-lockfile-check:
+  stage: lockfile-check
+  image: golang:$GO_VERSION
+  extends: .lockfile-rules
+  rules:
+    - exists:
+        - go.mod
+      when: always
+    - when: never
+  script:
+    - |
+      if [ ! -f go.sum ]; then
+        echo "ERROR: go.sum is missing - run 'go mod tidy'"
+        exit 1
+      fi
+
+    - |
+      echo "Running: go mod verify"
+      go mod verify
+      echo "All module hashes verified"
+
+    - |
+      go mod tidy
+      if ! git diff --exit-code go.mod go.sum; then
+        echo "ERROR: go.mod or go.sum is out of sync - run 'go mod tidy'"
+        exit 1
+      fi
+      echo "go.mod and go.sum are in sync"

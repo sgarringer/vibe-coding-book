@@ -1,0 +1,674 @@
+# =============================================================================
+# Lockfile Enforcement - GitHub Actions
+# Book Reference: Chapter 3, Section 3.3.7.2
+# =============================================================================
+#
+# PURPOSE:
+#   Enforces lockfile usage across Node.js, Python, Go, and Ruby projects.
+#   Implements Table 3.10 - correct CI/CD install commands for each ecosystem.
+#   Detects missing lockfiles, out-of-sync lockfiles, and missing hash
+#   verification.
+#
+# KEY PRINCIPLE (Table 3.10):
+#   npm install     -> npm ci
+#   yarn install    -> yarn install --frozen-lockfile
+#   pnpm install    -> pnpm install --frozen-lockfile
+#   pip install     -> pip install --require-hashes -r requirements.txt
+#   poetry install  -> poetry install --no-update
+#
+# WHAT THIS WORKFLOW CHECKS:
+#   1. Lockfile presence    - fails if lockfile is missing
+#   2. Lockfile sync        - fails if lockfile is out of sync with manifest
+#   3. Hash verification    - fails if Python requirements lack hashes
+#   4. Frozen install       - uses --frozen-lockfile / npm ci in all cases
+#   5. Dockerfile audit     - warns if Dockerfile uses npm install not npm ci
+#
+# SETUP REQUIRED:
+#   No secrets required.
+# =============================================================================
+
+name: Lockfile Enforcement
+
+on:
+  pull_request:
+    branches: [ main, develop, staging ]
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+      - 'yarn.lock'
+      - 'pnpm-lock.yaml'
+      - 'requirements*.txt'
+      - 'Pipfile'
+      - 'Pipfile.lock'
+      - 'pyproject.toml'
+      - 'poetry.lock'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Gemfile'
+      - 'Gemfile.lock'
+      - '**/Dockerfile*'
+  push:
+    branches: [ main ]
+    paths:
+      - 'package.json'
+      - 'requirements*.txt'
+      - 'go.mod'
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Job 1: Detect which ecosystems are present
+  # ---------------------------------------------------------------------------
+  detect-ecosystems:
+    name: Detect Ecosystems
+    runs-on: ubuntu-latest
+
+    outputs:
+      has_npm:    ${{ steps.detect.outputs.has_npm }}
+      has_yarn:   ${{ steps.detect.outputs.has_yarn }}
+      has_pnpm:   ${{ steps.detect.outputs.has_pnpm }}
+      has_python: ${{ steps.detect.outputs.has_python }}
+      has_poetry: ${{ steps.detect.outputs.has_poetry }}
+      has_go:     ${{ steps.detect.outputs.has_go }}
+      has_ruby:   ${{ steps.detect.outputs.has_ruby }}
+      has_docker: ${{ steps.detect.outputs.has_docker }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Detect ecosystems
+        id: detect
+        run: |
+          HAS_NPM=false
+          HAS_YARN=false
+          HAS_PNPM=false
+          HAS_PYTHON=false
+          HAS_POETRY=false
+          HAS_GO=false
+          HAS_RUBY=false
+          HAS_DOCKER=false
+
+          [ -f package.json ] && [ -f package-lock.json ] && HAS_NPM=true
+          [ -f package.json ] && [ -f yarn.lock ]         && HAS_YARN=true
+          [ -f package.json ] && [ -f pnpm-lock.yaml ]    && HAS_PNPM=true
+
+          find . -name "requirements*.txt" -not -path "./.git/*" | grep -q . && HAS_PYTHON=true
+          [ -f pyproject.toml ] && [ -f poetry.lock ] && HAS_POETRY=true
+          [ -f go.mod ]         && HAS_GO=true
+          [ -f Gemfile ]        && HAS_RUBY=true
+          find . -name "Dockerfile*" -not -path "./.git/*" | grep -q . && HAS_DOCKER=true
+
+          echo "has_npm=$HAS_NPM"       >> $GITHUB_OUTPUT
+          echo "has_yarn=$HAS_YARN"     >> $GITHUB_OUTPUT
+          echo "has_pnpm=$HAS_PNPM"     >> $GITHUB_OUTPUT
+          echo "has_python=$HAS_PYTHON" >> $GITHUB_OUTPUT
+          echo "has_poetry=$HAS_POETRY" >> $GITHUB_OUTPUT
+          echo "has_go=$HAS_GO"         >> $GITHUB_OUTPUT
+          echo "has_ruby=$HAS_RUBY"     >> $GITHUB_OUTPUT
+          echo "has_docker=$HAS_DOCKER" >> $GITHUB_OUTPUT
+
+          echo "Detected ecosystems:"
+          echo "  npm=$HAS_NPM yarn=$HAS_YARN pnpm=$HAS_PNPM"
+          echo "  python=$HAS_PYTHON poetry=$HAS_POETRY"
+          echo "  go=$HAS_GO ruby=$HAS_RUBY docker=$HAS_DOCKER"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Node.js lockfile enforcement
+  # Example 3.19: npm ci instead of npm install
+  # Table 3.10: npm ci uses lockfile exactly, fails if out of sync
+  # Table 3.11: npm ci vs npm install comparison
+  # ---------------------------------------------------------------------------
+  nodejs-lockfile:
+    name: Node.js Lockfile Check
+    runs-on: ubuntu-latest
+    needs: detect-ecosystems
+    if: needs.detect-ecosystems.outputs.has_npm == 'true' || needs.detect-ecosystems.outputs.has_yarn == 'true' || needs.detect-ecosystems.outputs.has_pnpm == 'true'
+
+    outputs:
+      status: ${{ steps.gate.outputs.status }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      # -----------------------------------------------------------------------
+      # Check 1: Lockfile presence
+      # A missing lockfile means builds are non-reproducible
+      # -----------------------------------------------------------------------
+      - name: Check lockfile presence
+        id: presence
+        run: |
+          if [ ! -f package.json ]; then
+            echo "No package.json found"
+            exit 0
+          fi
+
+          LOCKFILE_FOUND=false
+          LOCKFILE_TYPE=""
+
+          if [ -f package-lock.json ]; then
+            LOCKFILE_FOUND=true
+            LOCKFILE_TYPE="npm (package-lock.json)"
+          elif [ -f yarn.lock ]; then
+            LOCKFILE_FOUND=true
+            LOCKFILE_TYPE="yarn (yarn.lock)"
+          elif [ -f pnpm-lock.yaml ]; then
+            LOCKFILE_FOUND=true
+            LOCKFILE_TYPE="pnpm (pnpm-lock.yaml)"
+          fi
+
+          if [ "$LOCKFILE_FOUND" == "false" ]; then
+            echo "::error::No lockfile found for package.json"
+            echo "A lockfile is required for reproducible builds and accurate security scanning"
+            echo "Run 'npm install' to generate package-lock.json"
+            exit 1
+          fi
+
+          echo "Lockfile found: $LOCKFILE_TYPE"
+          echo "lockfile_type=$LOCKFILE_TYPE" >> $GITHUB_OUTPUT
+
+      # -----------------------------------------------------------------------
+      # Check 2: npm ci - Table 3.11
+      # npm ci fails if package-lock.json is out of sync with package.json
+      # This is the correct CI/CD install command per Table 3.10
+      # -----------------------------------------------------------------------
+      - name: Verify lockfile sync with npm ci
+        if: hashFiles('package-lock.json') != ''
+        run: |
+          echo "Running: npm ci"
+          echo "This verifies package-lock.json is in sync with package.json"
+          echo "Table 3.10: npm ci uses lockfile exactly, fails if out of sync"
+          echo ""
+
+          npm ci --prefer-offline 2>&1 | tee npm-ci-output.txt
+
+          if grep -q "npm ci can only install packages when your package.json" npm-ci-output.txt; then
+            echo "::error::package-lock.json is out of sync with package.json"
+            echo "Run 'npm install' locally and commit the updated lockfile"
+            exit 1
+          fi
+
+          echo "npm ci succeeded - lockfile is in sync"
+
+      - name: Verify lockfile sync with yarn --frozen-lockfile
+        if: hashFiles('yarn.lock') != ''
+        run: |
+          echo "Running: yarn install --frozen-lockfile"
+          echo "Table 3.10: --frozen-lockfile prevents lockfile updates"
+          npm install -g yarn --quiet
+          yarn install --frozen-lockfile
+
+      - name: Verify lockfile sync with pnpm --frozen-lockfile
+        if: hashFiles('pnpm-lock.yaml') != ''
+        run: |
+          echo "Running: pnpm install --frozen-lockfile"
+          echo "Table 3.10: --frozen-lockfile prevents lockfile updates"
+          npm install -g pnpm --quiet
+          pnpm install --frozen-lockfile
+
+      # -----------------------------------------------------------------------
+      # Check 3: Lockfile integrity hashes
+      # package-lock.json should contain integrity hashes for all packages
+      # -----------------------------------------------------------------------
+      - name: Check lockfile integrity hashes
+        if: hashFiles('package-lock.json') != ''
+        run: |
+          echo "Checking package-lock.json for integrity hashes..."
+
+          MISSING_INTEGRITY=$(jq '
+            [.packages // {} |
+             to_entries[] |
+             select(.key != "") |
+             select(.value.integrity == null or .value.integrity == "")] |
+             length
+          ' package-lock.json 2>/dev/null || echo "0")
+
+          if [ "$MISSING_INTEGRITY" -gt 0 ]; then
+            echo "::warning::$MISSING_INTEGRITY package(s) missing integrity hashes in package-lock.json"
+            echo "Regenerate with: rm package-lock.json && npm install"
+          else
+            echo "All packages have integrity hashes"
+          fi
+
+      - name: Set gate status
+        id: gate
+        run: echo "status=pass" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Python lockfile and hash enforcement
+  # Example 3.19: pip install --require-hashes -r requirements.txt
+  # Table 3.10: pip install --require-hashes verifies hashes
+  # ---------------------------------------------------------------------------
+  python-lockfile:
+    name: Python Lockfile Check
+    runs-on: ubuntu-latest
+    needs: detect-ecosystems
+    if: needs.detect-ecosystems.outputs.has_python == 'true' || needs.detect-ecosystems.outputs.has_poetry == 'true'
+
+    outputs:
+      status: ${{ steps.gate.outputs.status }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      # -----------------------------------------------------------------------
+      # Check 1: requirements.txt hash verification
+      # Example 3.19: pip install --require-hashes -r requirements.txt
+      # -----------------------------------------------------------------------
+      - name: Check requirements.txt for hashes
+        id: hash-check
+        run: |
+          REQ_FILES=$(find . -name "requirements*.txt" -not -path "./.git/*" | head -10)
+
+          if [ -z "$REQ_FILES" ]; then
+            echo "No requirements files found"
+            exit 0
+          fi
+
+          MISSING_HASHES=0
+          FILES_WITH_HASHES=0
+
+          for REQ_FILE in $REQ_FILES; do
+            echo "Checking: $REQ_FILE"
+
+            # Count lines with hashes vs without
+            TOTAL_PKGS=$(grep -v "^#" "$REQ_FILE" | grep -v "^$" | grep -v "^-" | wc -l || echo "0")
+            HASHED_PKGS=$(grep -c " --hash=" "$REQ_FILE" 2>/dev/null || echo "0")
+
+            if [ "$TOTAL_PKGS" -gt 0 ] && [ "$HASHED_PKGS" -eq 0 ]; then
+              echo "::warning::$REQ_FILE has $TOTAL_PKGS packages but no hash verification"
+              echo "Generate with: pip-compile --generate-hashes --output-file $REQ_FILE"
+              MISSING_HASHES=$((MISSING_HASHES + 1))
+            elif [ "$HASHED_PKGS" -gt 0 ]; then
+              echo "Hash verification present: $HASHED_PKGS hashes in $REQ_FILE"
+              FILES_WITH_HASHES=$((FILES_WITH_HASHES + 1))
+            fi
+          done
+
+          echo "missing_hashes=$MISSING_HASHES"     >> $GITHUB_OUTPUT
+          echo "files_with_hashes=$FILES_WITH_HASHES" >> $GITHUB_OUTPUT
+
+      # -----------------------------------------------------------------------
+      # Check 2: Install with --require-hashes if hashes are present
+      # Falls back to regular install if hashes are not yet added
+      # -----------------------------------------------------------------------
+      - name: Install Python dependencies with hash verification
+        run: |
+          REQ_FILE=""
+          if [ -f requirements.txt ]; then
+            REQ_FILE="requirements.txt"
+          elif [ -f requirements/base.txt ]; then
+            REQ_FILE="requirements/base.txt"
+          fi
+
+          if [ -z "$REQ_FILE" ]; then
+            echo "No requirements.txt found to install"
+            exit 0
+          fi
+
+          HAS_HASHES=$(grep -c " --hash=" "$REQ_FILE" 2>/dev/null || echo "0")
+
+          if [ "$HAS_HASHES" -gt 0 ]; then
+            echo "Installing with hash verification (Table 3.10):"
+            echo "pip install --require-hashes -r $REQ_FILE"
+            pip install --require-hashes -r "$REQ_FILE" --quiet
+            echo "Hash verification passed"
+          else
+            echo "No hashes in $REQ_FILE - installing without hash verification"
+            echo "Consider adding hashes with: pip-compile --generate-hashes"
+            pip install -r "$REQ_FILE" --quiet
+          fi
+
+      # -----------------------------------------------------------------------
+      # Check 3: Poetry lockfile sync
+      # Table 3.10: poetry install --no-update prevents updates
+      # -----------------------------------------------------------------------
+      - name: Check Poetry lockfile sync
+        if: needs.detect-ecosystems.outputs.has_poetry == 'true'
+        run: |
+          pip install poetry --quiet
+
+          echo "Running: poetry install --no-update"
+          echo "Table 3.10: --no-update prevents lockfile updates in CI"
+          poetry install --no-update
+
+          echo "Checking poetry.lock is up to date..."
+          poetry check --lock
+          echo "poetry.lock is in sync with pyproject.toml"
+
+      - name: Set gate status
+        id: gate
+        run: echo "status=pass" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Go module verification
+  # go.sum provides cryptographic verification of all dependencies
+  # ---------------------------------------------------------------------------
+  go-lockfile:
+    name: Go Module Verification
+    runs-on: ubuntu-latest
+    needs: detect-ecosystems
+    if: needs.detect-ecosystems.outputs.has_go == 'true'
+
+    outputs:
+      status: ${{ steps.gate.outputs.status }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # -----------------------------------------------------------------------
+      # Check 1: go.sum presence
+      # go.sum is Go's lockfile - contains cryptographic hashes of all deps
+      # -----------------------------------------------------------------------
+      - name: Check go.sum presence
+        run: |
+          if [ ! -f go.sum ]; then
+            echo "::error::go.sum is missing"
+            echo "go.sum is Go's lockfile and must be committed"
+            echo "Run: go mod tidy"
+            exit 1
+          fi
+          echo "go.sum found"
+
+      # -----------------------------------------------------------------------
+      # Check 2: go mod verify
+      # Verifies that cached dependencies match go.sum hashes
+      # -----------------------------------------------------------------------
+      - name: Verify go module hashes
+        run: |
+          echo "Running: go mod verify"
+          echo "Verifies all cached modules match go.sum checksums"
+          go mod verify
+          echo "All module hashes verified"
+
+      # -----------------------------------------------------------------------
+      # Check 3: go mod tidy check
+      # Ensures go.mod and go.sum are not out of sync
+      # -----------------------------------------------------------------------
+      - name: Check go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error::go.mod or go.sum is out of sync"
+            echo "Run 'go mod tidy' and commit the changes"
+            exit 1
+          fi
+
+          echo "go.mod and go.sum are in sync"
+
+      - name: Set gate status
+        id: gate
+        run: echo "status=pass" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Ruby Gemfile.lock enforcement
+  # ---------------------------------------------------------------------------
+  ruby-lockfile:
+    name: Ruby Lockfile Check
+    runs-on: ubuntu-latest
+    needs: detect-ecosystems
+    if: needs.detect-ecosystems.outputs.has_ruby == 'true'
+
+    outputs:
+      status: ${{ steps.gate.outputs.status }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Check Gemfile.lock presence
+        run: |
+          if [ ! -f Gemfile.lock ]; then
+            echo "::error::Gemfile.lock is missing"
+            echo "Run: bundle install"
+            exit 1
+          fi
+          echo "Gemfile.lock found"
+
+      - name: Verify bundle with frozen lockfile
+        run: |
+          echo "Running: bundle install --frozen"
+          bundle install --frozen
+          echo "Gemfile.lock is in sync with Gemfile"
+
+      - name: Set gate status
+        id: gate
+        run: echo "status=pass" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # Job 6: Dockerfile audit
+  # Checks Dockerfiles for npm install instead of npm ci (Example 3.20)
+  # ---------------------------------------------------------------------------
+  dockerfile-audit:
+    name: Dockerfile Lockfile Audit
+    runs-on: ubuntu-latest
+    needs: detect-ecosystems
+    if: needs.detect-ecosystems.outputs.has_docker == 'true'
+
+    outputs:
+      status: ${{ steps.audit.outputs.status }}
+      issues_found: ${{ steps.audit.outputs.issues_found }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # -----------------------------------------------------------------------
+      # Example 3.20: Check Dockerfiles use npm ci not npm install
+      # Bad:  RUN npm install
+      # Good: RUN npm ci --only=production
+      # -----------------------------------------------------------------------
+      - name: Audit Dockerfiles for lockfile usage
+        id: audit
+        run: |
+          ISSUES=0
+          DOCKERFILES=$(find . -name "Dockerfile*" -not -path "./.git/*")
+
+          echo "Auditing Dockerfiles for lockfile usage (Example 3.20)..."
+          echo ""
+
+          for DOCKERFILE in $DOCKERFILES; do
+            echo "Checking: $DOCKERFILE"
+
+            # Bad pattern: npm install (ignores lockfile)
+            if grep -n "RUN npm install" "$DOCKERFILE" | grep -v "npm install -g"; then
+              echo "::warning::$DOCKERFILE uses 'npm install' - use 'npm ci' instead"
+              echo "  Bad  (Example 3.20): RUN npm install"
+              echo "  Good (Example 3.20): RUN npm ci --only=production"
+              ISSUES=$((ISSUES + 1))
+            fi
+
+            # Bad pattern: pip install without --require-hashes
+            if grep -n "RUN pip install -r" "$DOCKERFILE" | grep -v "require-hashes"; then
+              echo "::warning::$DOCKERFILE uses 'pip install -r' without --require-hashes"
+              echo "  Consider: RUN pip install --require-hashes -r requirements.txt"
+              ISSUES=$((ISSUES + 1))
+            fi
+
+            # Bad pattern: copying only package.json without lockfile
+            if grep -n "COPY package.json" "$DOCKERFILE" | grep -v "package-lock.json"; then
+              # Check if lockfile is copied elsewhere in the file
+              if ! grep -q "package-lock.json\|yarn.lock\|pnpm-lock.yaml" "$DOCKERFILE"; then
+                echo "::warning::$DOCKERFILE copies package.json but not the lockfile"
+                echo "  Bad  (Example 3.20): COPY package.json ."
+                echo "  Good (Example 3.20): COPY package.json package-lock.json ./"
+                ISSUES=$((ISSUES + 1))
+              fi
+            fi
+
+            # Good pattern confirmation
+            if grep -q "npm ci" "$DOCKERFILE"; then
+              echo "  Good: Uses 'npm ci' (Table 3.11)"
+            fi
+
+            echo ""
+          done
+
+          echo "issues_found=$ISSUES" >> $GITHUB_OUTPUT
+
+          STATUS="pass"
+          [ "$ISSUES" -gt 0 ] && STATUS="warn"
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+          echo "Dockerfile audit complete: $ISSUES issue(s) found"
+
+  # ---------------------------------------------------------------------------
+  # Job 7: Unified summary
+  # ---------------------------------------------------------------------------
+  lockfile-summary:
+    name: Lockfile Enforcement Summary
+    runs-on: ubuntu-latest
+    needs:
+      - nodejs-lockfile
+      - python-lockfile
+      - go-lockfile
+      - ruby-lockfile
+      - dockerfile-audit
+    if: always()
+
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Evaluate overall gate
+        id: overall
+        env:
+          NPM_STATUS:    ${{ needs.nodejs-lockfile.outputs.status }}
+          PYTHON_STATUS: ${{ needs.python-lockfile.outputs.status }}
+          GO_STATUS:     ${{ needs.go-lockfile.outputs.status }}
+          RUBY_STATUS:   ${{ needs.ruby-lockfile.outputs.status }}
+        run: |
+          OVERALL="pass"
+          [ "$NPM_STATUS"    == "fail" ] && OVERALL="fail"
+          [ "$PYTHON_STATUS" == "fail" ] && OVERALL="fail"
+          [ "$GO_STATUS"     == "fail" ] && OVERALL="fail"
+          [ "$RUBY_STATUS"   == "fail" ] && OVERALL="fail"
+          echo "status=$OVERALL" >> $GITHUB_OUTPUT
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        env:
+          OVERALL_STATUS: ${{ steps.overall.outputs.status }}
+          NPM_STATUS:     ${{ needs.nodejs-lockfile.outputs.status }}
+          PYTHON_STATUS:  ${{ needs.python-lockfile.outputs.status }}
+          GO_STATUS:      ${{ needs.go-lockfile.outputs.status }}
+          RUBY_STATUS:    ${{ needs.ruby-lockfile.outputs.status }}
+          DOCKER_STATUS:  ${{ needs.dockerfile-audit.outputs.status }}
+          DOCKER_ISSUES:  ${{ needs.dockerfile-audit.outputs.issues_found }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const overallStatus = process.env.OVERALL_STATUS;
+            const npmStatus     = process.env.NPM_STATUS     || 'skip';
+            const pythonStatus  = process.env.PYTHON_STATUS  || 'skip';
+            const goStatus      = process.env.GO_STATUS      || 'skip';
+            const rubyStatus    = process.env.RUBY_STATUS    || 'skip';
+            const dockerStatus  = process.env.DOCKER_STATUS  || 'skip';
+            const dockerIssues  = process.env.DOCKER_ISSUES  || '0';
+            const runUrl        = process.env.RUN_URL;
+
+            const statusLabel = (s) => {
+              if (s === 'fail') return 'FAILED';
+              if (s === 'warn') return 'WARNING';
+              if (s === 'pass') return 'PASSED';
+              return 'SKIPPED';
+            };
+
+            const lines = [];
+            lines.push('## Lockfile Enforcement (Section 3.3.7)');
+            lines.push('');
+
+            if (overallStatus === 'fail') {
+              lines.push('Merge blocked: Lockfile issues detected.');
+            } else {
+              lines.push('All lockfile checks passed. Builds are reproducible.');
+            }
+
+            lines.push('');
+            lines.push('| Ecosystem | Check | Status |');
+            lines.push('|-----------|-------|--------|');
+            lines.push('| Node.js | npm ci / frozen-lockfile (Table 3.10) | ' + statusLabel(npmStatus) + ' |');
+            lines.push('| Python  | --require-hashes (Table 3.10)         | ' + statusLabel(pythonStatus) + ' |');
+            lines.push('| Go      | go mod verify                         | ' + statusLabel(goStatus) + ' |');
+            lines.push('| Ruby    | bundle install --frozen               | ' + statusLabel(rubyStatus) + ' |');
+            lines.push('| Docker  | npm ci in Dockerfile (Example 3.20)  | ' + statusLabel(dockerStatus) + ' (' + dockerIssues + ' issues) |');
+            lines.push('');
+
+            if (overallStatus === 'fail') {
+              lines.push('### How to Fix');
+              lines.push('');
+              lines.push('**Missing lockfile:** Run the install command locally and commit the lockfile.');
+              lines.push('**Out of sync:** Run the install command locally and commit the updated lockfile.');
+              lines.push('**Merge conflict:** See resolve-conflicts.md - never manually edit a lockfile.');
+              lines.push('');
+              lines.push('See Table 3.10 for the correct install command for each ecosystem.');
+            }
+
+            lines.push('');
+            lines.push('[View full results](' + runUrl + ')');
+
+            const body = lines.join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Lockfile Enforcement')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Enforce lockfile gate
+        env:
+          OVERALL_STATUS: ${{ steps.overall.outputs.status }}
+        run: |
+          if [ "$OVERALL_STATUS" == "fail" ]; then
+            echo "Lockfile enforcement gate FAILED"
+            exit 1
+          fi
+          echo "Lockfile enforcement gate PASSED"

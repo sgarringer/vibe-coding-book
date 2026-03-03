@@ -1,0 +1,305 @@
+# =============================================================================
+# Week 5+: Enforcement Mode Configuration
+# Book Reference: Chapter 3, Section 3.2.1.3
+# =============================================================================
+#
+# PURPOSE:
+#   Full enforcement of Table 3.4 thresholds.
+#   Critical always breaks. High breaks above threshold.
+#   Medium warns. Low is ignored or tracked in backlog.
+#
+# QUARTERLY REVIEW CHECKLIST:
+#   □ Review false positive rate - tighten rules if > 10%
+#   □ Review high threshold - lower if team is consistently below it
+#   □ Review medium findings - consider moving some to break
+#   □ Add new Semgrep rule sets as codebase evolves
+#   □ Update dependency scan policies for new package ecosystems
+#   □ Review override usage - investigate if > 3/month
+# =============================================================================
+
+name: Security Gate - Week 5+ (Enforcement Mode)
+
+on:
+  push:
+    branches: [ main, develop, staging ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 2 * * 1'    # Weekly full scan Monday 2am UTC
+
+jobs:
+
+  enforcement-gate:
+    name: "🔒 Enforcement Mode - Full Security Gate"
+    runs-on: ubuntu-latest
+
+    permissions:
+      pull-requests: write
+      contents:      read
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Load thresholds
+        id: thresholds
+        run: |
+          # Load from .security/thresholds.yml (Example 3.6)
+          # Falls back to Table 3.4 defaults
+          if [ -f ".security/thresholds.yml" ] && command -v yq &>/dev/null; then
+            SAST_CRIT=$(yq '.sast.critical'          .security/thresholds.yml)
+            SAST_HIGH=$(yq '.sast.high'              .security/thresholds.yml)
+            SAST_MED=$(yq  '.sast.medium'            .security/thresholds.yml)
+            DEP_CRIT=$(yq  '.dependencies.critical'  .security/thresholds.yml)
+            DEP_HIGH=$(yq  '.dependencies.high'      .security/thresholds.yml)
+            echo "Loaded thresholds from .security/thresholds.yml"
+          else
+            # Table 3.4 enforcement defaults
+            SAST_CRIT=0
+            SAST_HIGH=3
+            SAST_MED=10
+            DEP_CRIT=0
+            DEP_HIGH=5
+            echo "Using Table 3.4 default thresholds"
+          fi
+
+          echo "sast_critical=$SAST_CRIT" >> $GITHUB_OUTPUT
+          echo "sast_high=$SAST_HIGH"     >> $GITHUB_OUTPUT
+          echo "sast_medium=$SAST_MED"    >> $GITHUB_OUTPUT
+          echo "dep_critical=$DEP_CRIT"   >> $GITHUB_OUTPUT
+          echo "dep_high=$DEP_HIGH"       >> $GITHUB_OUTPUT
+
+          echo "Thresholds: SAST Crit=$SAST_CRIT High=$SAST_HIGH Med=$SAST_MED | Dep Crit=$DEP_CRIT High=$DEP_HIGH"
+
+      - name: Run Semgrep SAST
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" \
+            returntocorp/semgrep \
+            semgrep scan \
+              --config=auto \
+              --config=p/security-audit \
+              --config=p/owasp-top-ten \
+              --json \
+              --output=/src/sast-results.json \
+              --sarif \
+              --sarif-output=/src/sast-results.sarif \
+              /src || true
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: sast-results.sarif
+          category:   semgrep-enforcement
+
+      - name: Run Trivy dependency scan
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" \
+            aquasec/trivy:latest \
+            fs \
+              --format json \
+              --output /src/trivy-results.json \
+              --exit-code 0 \
+              /src || true
+
+      - name: Count findings
+        id: counts
+        run: |
+          SAST_CRIT=$(jq '[.results[] |
+            select(.extra.severity == "ERROR")]   | length' \
+            sast-results.json 2>/dev/null || echo "0")
+          SAST_HIGH=$(jq '[.results[] |
+            select(.extra.severity == "WARNING")] | length' \
+            sast-results.json 2>/dev/null || echo "0")
+          SAST_MED=$(jq  '[.results[] |
+            select(.extra.severity == "INFO")]    | length' \
+            sast-results.json 2>/dev/null || echo "0")
+          DEP_CRIT=$(jq  '[.Results[].Vulnerabilities[]? |
+            select(.Severity == "CRITICAL")] | length' \
+            trivy-results.json 2>/dev/null || echo "0")
+          DEP_HIGH=$(jq  '[.Results[].Vulnerabilities[]? |
+            select(.Severity == "HIGH")]     | length' \
+            trivy-results.json 2>/dev/null || echo "0")
+          DEP_MED=$(jq   '[.Results[].Vulnerabilities[]? |
+            select(.Severity == "MEDIUM")]   | length' \
+            trivy-results.json 2>/dev/null || echo "0")
+
+          echo "sast_critical=$SAST_CRIT" >> $GITHUB_OUTPUT
+          echo "sast_high=$SAST_HIGH"     >> $GITHUB_OUTPUT
+          echo "sast_medium=$SAST_MED"    >> $GITHUB_OUTPUT
+          echo "dep_critical=$DEP_CRIT"   >> $GITHUB_OUTPUT
+          echo "dep_high=$DEP_HIGH"       >> $GITHUB_OUTPUT
+          echo "dep_medium=$DEP_MED"      >> $GITHUB_OUTPUT
+
+      - name: Enforce security gate (Table 3.4)
+        id: gate
+        run: |
+          SAST_CRIT="${{ steps.counts.outputs.sast_critical }}"
+          SAST_HIGH="${{ steps.counts.outputs.sast_high }}"
+          SAST_MED="${{  steps.counts.outputs.sast_medium }}"
+          DEP_CRIT="${{  steps.counts.outputs.dep_critical }}"
+          DEP_HIGH="${{  steps.counts.outputs.dep_high }}"
+
+          T_SAST_CRIT="${{ steps.thresholds.outputs.sast_critical }}"
+          T_SAST_HIGH="${{ steps.thresholds.outputs.sast_high }}"
+          T_SAST_MED="${{  steps.thresholds.outputs.sast_medium }}"
+          T_DEP_CRIT="${{  steps.thresholds.outputs.dep_critical }}"
+          T_DEP_HIGH="${{  steps.thresholds.outputs.dep_high }}"
+
+          GATE_STATUS="pass"
+          FAILURES=""
+          WARNINGS=""
+
+          # Critical - always break (Table 3.4)
+          [ "$SAST_CRIT" -gt "$T_SAST_CRIT" ] && {
+            GATE_STATUS="fail"
+            FAILURES="$FAILURES\n❌ SAST Critical: $SAST_CRIT (threshold: $T_SAST_CRIT)"
+          }
+          [ "$DEP_CRIT" -gt "$T_DEP_CRIT" ] && {
+            GATE_STATUS="fail"
+            FAILURES="$FAILURES\n❌ Dep Critical: $DEP_CRIT (threshold: $T_DEP_CRIT)"
+          }
+
+          # High - break above threshold (Table 3.4)
+          [ "$SAST_HIGH" -gt "$T_SAST_HIGH" ] && {
+            GATE_STATUS="fail"
+            FAILURES="$FAILURES\n❌ SAST High: $SAST_HIGH (threshold: $T_SAST_HIGH)"
+          }
+          [ "$DEP_HIGH" -gt "$T_DEP_HIGH" ] && {
+            GATE_STATUS="fail"
+            FAILURES="$FAILURES\n❌ Dep High: $DEP_HIGH (threshold: $T_DEP_HIGH)"
+          }
+
+          # Medium - warn only (Table 3.4)
+          [ "$SAST_MED" -gt "$T_SAST_MED" ] && {
+            WARNINGS="$WARNINGS\n⚠️  SAST Medium: $SAST_MED (threshold: $T_SAST_MED)"
+          }
+
+          # Low - ignored per Table 3.4
+          # (tracked in GitHub Security tab via SARIF upload)
+
+          echo "status=$GATE_STATUS" >> $GITHUB_OUTPUT
+
+          echo "============================================"
+          echo "  Security Gate Evaluation (Table 3.4)"
+          echo "============================================"
+          printf "Failures:$FAILURES\n" 2>/dev/null || true
+          printf "Warnings:$WARNINGS\n" 2>/dev/null || true
+          echo "Status: $GATE_STATUS"
+          echo "============================================"
+
+          # Set build to unstable on warnings
+          if [ -n "$WARNINGS" ]; then
+            echo "::warning::Security warnings detected - address in next sprint"
+            printf "$WARNINGS\n"
+          fi
+
+          # Fail on threshold breaches
+          if [ "$GATE_STATUS" == "fail" ]; then
+            echo "::error::Security gate FAILED - merge blocked"
+            printf "$FAILURES\n"
+            exit 1
+          fi
+
+          echo "✅ Enforcement mode gate passed."
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const gateStatus = '${{ steps.gate.outputs.status }}';
+            const sastCrit   = parseInt('${{ steps.counts.outputs.sast_critical }}');
+            const sastHigh   = parseInt('${{ steps.counts.outputs.sast_high }}');
+            const sastMed    = parseInt('${{ steps.counts.outputs.sast_medium }}');
+            const depCrit    = parseInt('${{ steps.counts.outputs.dep_critical }}');
+            const depHigh    = parseInt('${{ steps.counts.outputs.dep_high }}');
+            const depMed     = parseInt('${{ steps.counts.outputs.dep_medium }}');
+
+            const tSastCrit = parseInt('${{ steps.thresholds.outputs.sast_critical }}');
+            const tSastHigh = parseInt('${{ steps.thresholds.outputs.sast_high }}');
+            const tDepCrit  = parseInt('${{ steps.thresholds.outputs.dep_critical }}');
+            const tDepHigh  = parseInt('${{ steps.thresholds.outputs.dep_high }}');
+
+            const icon = gateStatus === 'pass' ? '✅' : '❌';
+
+            // Helper to flag cells that exceed threshold
+            const flag = (count, threshold) =>
+              count > threshold ? `**${count}** ⚠️` : `${count}`;
+
+            let body = `## ${icon} Security Gate: ${gateStatus.toUpperCase()} (Enforcement Mode)\n\n`;
+
+            // Results vs thresholds table
+            body += `### Results vs Thresholds (Table 3.4)\n\n`;
+            body += `| Scanner | Critical | Threshold | High | Threshold | Medium |\n`;
+            body += `|---------|----------|-----------|------|-----------|--------|\n`;
+            body += `| SAST | ${flag(sastCrit, tSastCrit)} | ${tSastCrit} `;
+            body += `| ${flag(sastHigh, tSastHigh)} | ${tSastHigh} | ${sastMed} |\n`;
+            body += `| Dependencies | ${flag(depCrit, tDepCrit)} | ${tDepCrit} `;
+            body += `| ${flag(depHigh, tDepHigh)} | ${tDepHigh} | ${depMed} |\n\n`;
+
+            if (gateStatus === 'fail') {
+              body += `### ❌ Merge Blocked\n\n`;
+              body += `One or more security thresholds were exceeded.\n`;
+              body += `Fix the flagged findings and re-run the pipeline.\n\n`;
+              body += `**Need help?**\n`;
+              body += `- Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for detailed findings\n`;
+              body += `- Review the [security wiki](https://github.com/${{ github.repository }}/wiki/Security-Findings) for common fixes\n`;
+              body += `- Ask in \`#security-help\` Slack channel\n`;
+              body += `- For genuine emergencies, see the [override process](https://github.com/${{ github.repository }}/blob/main/.github/workflows/override-mechanism.yml)\n\n`;
+            } else {
+              body += `### ✅ All Thresholds Met\n\n`;
+              body += `Security gate passed. All findings are within configured thresholds.\n\n`;
+            }
+
+            // Quarterly review reminder (show on first Monday of month)
+            const today = new Date();
+            if (today.getDay() === 1 && today.getDate() <= 7) {
+              body += `> 📅 **Quarterly Reminder:** Review and tighten thresholds in \`.security/thresholds.yml\`\n\n`;
+            }
+
+            body += `---\n`;
+            body += `📦 [Scan artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) | `;
+            body += `🔒 [Security tab](https://github.com/${{ github.repository }}/security/code-scanning)\n`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Enforcement Mode')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: enforcement-${{ github.run_number }}
+          path: |
+            sast-results.json
+            sast-results.sarif
+            trivy-results.json
+          retention-days: 30

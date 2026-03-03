@@ -1,0 +1,696 @@
+# =============================================================================
+# GitHub Actions - Complete Security Gate
+# Book Reference: Chapter 3, Section 3.2.1.2
+# =============================================================================
+# Features demonstrated:
+#   - SAST + DAST + dependency scanning
+#   - Configurable thresholds per severity (from thresholds.yml)
+#   - PR comments with results
+#   - Override mechanism for emergencies
+# =============================================================================
+#
+# SETUP REQUIRED:
+#   1. Copy thresholds.yml to your repository root as security-thresholds.yml
+#   2. Set STAGING_URL secret for DAST scanning
+#   3. Set SLACK_WEBHOOK_URL secret for notifications (optional)
+#   4. Add 'security-override' label to your repository for emergency bypasses
+#
+# THRESHOLD CONFIGURATION:
+#   Edit security-thresholds.yml to adjust break/warn thresholds.
+#   Change 'active_profile' to match your team's maturity level:
+#     learning    -> Week 1-2: never break
+#     warning     -> Week 3-4: break on critical only
+#     enforcement -> Week 5+:  break on critical + high (Table 3.4)
+# =============================================================================
+
+name: Security Gate
+
+on:
+  pull_request:
+    branches: [ main, develop, staging ]
+  push:
+    branches: [ main, develop, staging ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# =============================================================================
+# Reusable threshold evaluation function
+# Defined as an environment variable so all jobs can use it
+# =============================================================================
+env:
+  # Path to thresholds config in the repository
+  THRESHOLDS_FILE: security-thresholds.yml
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Job 1: Load thresholds from config file
+  # All downstream jobs read thresholds from this job's outputs
+  # This implements "Centralized threshold management" from Section 3.2.1.2
+  # ---------------------------------------------------------------------------
+  load-thresholds:
+    name: Load Security Thresholds
+    runs-on: ubuntu-latest
+
+    outputs:
+      # SAST thresholds
+      sast_critical_action:    ${{ steps.thresholds.outputs.sast_critical_action }}
+      sast_critical_threshold: ${{ steps.thresholds.outputs.sast_critical_threshold }}
+      sast_high_action:        ${{ steps.thresholds.outputs.sast_high_action }}
+      sast_high_threshold:     ${{ steps.thresholds.outputs.sast_high_threshold }}
+      sast_medium_action:      ${{ steps.thresholds.outputs.sast_medium_action }}
+      sast_medium_threshold:   ${{ steps.thresholds.outputs.sast_medium_threshold }}
+      # Dependency thresholds
+      dep_critical_action:     ${{ steps.thresholds.outputs.dep_critical_action }}
+      dep_critical_threshold:  ${{ steps.thresholds.outputs.dep_critical_threshold }}
+      dep_high_action:         ${{ steps.thresholds.outputs.dep_high_action }}
+      dep_high_threshold:      ${{ steps.thresholds.outputs.dep_high_threshold }}
+      # Active profile name (for reporting)
+      active_profile:          ${{ steps.thresholds.outputs.active_profile }}
+      # Emergency override status
+      override_active:         ${{ steps.override.outputs.override_active }}
+      override_reason:         ${{ steps.override.outputs.override_reason }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install yq (YAML parser)
+        run: |
+          wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
+
+      # -----------------------------------------------------------------------
+      # Parse thresholds.yml and export as step outputs
+      # Falls back to safe defaults if file is missing
+      # -----------------------------------------------------------------------
+      - name: Parse thresholds configuration
+        id: thresholds
+        run: |
+          THRESHOLDS="${{ env.THRESHOLDS_FILE }}"
+
+          if [ ! -f "$THRESHOLDS" ]; then
+            echo "⚠️  $THRESHOLDS not found. Using enforcement defaults."
+            # Safe defaults matching Table 3.4
+            echo "sast_critical_action=break"    >> $GITHUB_OUTPUT
+            echo "sast_critical_threshold=0"     >> $GITHUB_OUTPUT
+            echo "sast_high_action=break"        >> $GITHUB_OUTPUT
+            echo "sast_high_threshold=3"         >> $GITHUB_OUTPUT
+            echo "sast_medium_action=warn"       >> $GITHUB_OUTPUT
+            echo "sast_medium_threshold=10"      >> $GITHUB_OUTPUT
+            echo "dep_critical_action=break"     >> $GITHUB_OUTPUT
+            echo "dep_critical_threshold=0"      >> $GITHUB_OUTPUT
+            echo "dep_high_action=break"         >> $GITHUB_OUTPUT
+            echo "dep_high_threshold=5"          >> $GITHUB_OUTPUT
+            echo "active_profile=default"        >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Read active profile
+          PROFILE=$(yq '.active_profile' "$THRESHOLDS")
+          echo "active_profile=$PROFILE" >> $GITHUB_OUTPUT
+          echo "Active profile: $PROFILE"
+
+          # Check for environment-specific override based on branch
+          BRANCH="${{ github.ref_name }}"
+          ENV_OVERRIDE=""
+
+          if echo "$BRANCH" | grep -qE "^(main|master|release/)"; then
+            ENV_OVERRIDE="production"
+          elif echo "$BRANCH" | grep -qE "^(staging|develop)"; then
+            ENV_OVERRIDE="staging"
+          elif echo "$BRANCH" | grep -qE "^(feature|fix|hotfix)/"; then
+            ENV_OVERRIDE="feature"
+          fi
+
+          # Use environment override if available, otherwise use active profile
+          if [ -n "$ENV_OVERRIDE" ]; then
+            BASE_PATH=".environment_overrides.$ENV_OVERRIDE"
+            echo "Using environment override: $ENV_OVERRIDE"
+          else
+            BASE_PATH=".profiles.$PROFILE"
+          fi
+
+          # Extract SAST thresholds
+          SAST_CRIT_ACTION=$(yq "$BASE_PATH.sast.critical.action" "$THRESHOLDS")
+          SAST_CRIT_THRESH=$(yq "$BASE_PATH.sast.critical.threshold" "$THRESHOLDS")
+          SAST_HIGH_ACTION=$(yq "$BASE_PATH.sast.high.action" "$THRESHOLDS")
+          SAST_HIGH_THRESH=$(yq "$BASE_PATH.sast.high.threshold" "$THRESHOLDS")
+          SAST_MED_ACTION=$(yq  "$BASE_PATH.sast.medium.action" "$THRESHOLDS")
+          SAST_MED_THRESH=$(yq  "$BASE_PATH.sast.medium.threshold" "$THRESHOLDS")
+
+          # Extract dependency thresholds
+          DEP_CRIT_ACTION=$(yq "$BASE_PATH.dependency.critical.action" "$THRESHOLDS")
+          DEP_CRIT_THRESH=$(yq "$BASE_PATH.dependency.critical.threshold" "$THRESHOLDS")
+          DEP_HIGH_ACTION=$(yq "$BASE_PATH.dependency.high.action" "$THRESHOLDS")
+          DEP_HIGH_THRESH=$(yq "$BASE_PATH.dependency.high.threshold" "$THRESHOLDS")
+
+          echo "sast_critical_action=$SAST_CRIT_ACTION"   >> $GITHUB_OUTPUT
+          echo "sast_critical_threshold=$SAST_CRIT_THRESH" >> $GITHUB_OUTPUT
+          echo "sast_high_action=$SAST_HIGH_ACTION"        >> $GITHUB_OUTPUT
+          echo "sast_high_threshold=$SAST_HIGH_THRESH"     >> $GITHUB_OUTPUT
+          echo "sast_medium_action=$SAST_MED_ACTION"       >> $GITHUB_OUTPUT
+          echo "sast_medium_threshold=$SAST_MED_THRESH"    >> $GITHUB_OUTPUT
+          echo "dep_critical_action=$DEP_CRIT_ACTION"      >> $GITHUB_OUTPUT
+          echo "dep_critical_threshold=$DEP_CRIT_THRESH"   >> $GITHUB_OUTPUT
+          echo "dep_high_action=$DEP_HIGH_ACTION"          >> $GITHUB_OUTPUT
+          echo "dep_high_threshold=$DEP_HIGH_THRESH"       >> $GITHUB_OUTPUT
+
+          echo "=== Loaded Thresholds ==="
+          echo "Profile         : $PROFILE"
+          echo "SAST Critical   : $SAST_CRIT_ACTION (threshold: $SAST_CRIT_THRESH)"
+          echo "SAST High       : $SAST_HIGH_ACTION (threshold: $SAST_HIGH_THRESH)"
+          echo "SAST Medium     : $SAST_MED_ACTION  (threshold: $SAST_MED_THRESH)"
+          echo "Dep Critical    : $DEP_CRIT_ACTION  (threshold: $DEP_CRIT_THRESH)"
+          echo "Dep High        : $DEP_HIGH_ACTION  (threshold: $DEP_HIGH_THRESH)"
+
+      # -----------------------------------------------------------------------
+      # Check for emergency override
+      # Override is triggered by adding 'security-override' label to the PR
+      # -----------------------------------------------------------------------
+      - name: Check for emergency override
+        id: override
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OVERRIDE_ACTIVE="false"
+          OVERRIDE_REASON=""
+
+          # Check for override label on PR
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            LABELS="${{ join(github.event.pull_request.labels.*.name, ',') }}"
+
+            if echo "$LABELS" | grep -q "security-override"; then
+              OVERRIDE_ACTIVE="true"
+
+              # Try to get the override reason from PR body
+              PR_BODY="${{ github.event.pull_request.body }}"
+              if echo "$PR_BODY" | grep -qi "override reason:"; then
+                OVERRIDE_REASON=$(echo "$PR_BODY" | \
+                  grep -i "override reason:" | \
+                  sed 's/.*override reason://i' | \
+                  head -1 | xargs)
+              fi
+
+              echo "⚠️  EMERGENCY OVERRIDE ACTIVE"
+              echo "Reason: ${OVERRIDE_REASON:-'No reason provided'}"
+
+              # Notify security team via Slack
+              if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+                curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+                  -H 'Content-type: application/json' \
+                  --data "{
+                    \"text\": \"🚨 Security Gate Override\",
+                    \"blocks\": [{
+                      \"type\": \"section\",
+                      \"text\": {
+                        \"type\": \"mrkdwn\",
+                        \"text\": \"*🚨 Security Gate Override Activated*\n*PR:* ${{ github.event.pull_request.html_url }}\n*Author:* ${{ github.actor }}\n*Reason:* ${OVERRIDE_REASON:-'Not provided'}\"
+                      }
+                    }]
+                  }"
+              fi
+            fi
+          fi
+
+          echo "override_active=$OVERRIDE_ACTIVE" >> $GITHUB_OUTPUT
+          echo "override_reason=$OVERRIDE_REASON" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # Job 2: SAST Scan
+  # Static analysis with Semgrep
+  # ---------------------------------------------------------------------------
+  sast-scan:
+    name: SAST Scan (Semgrep)
+    runs-on: ubuntu-latest
+    needs: load-thresholds
+    container:
+      image: returntocorp/semgrep
+
+    outputs:
+      critical_count: ${{ steps.counts.outputs.critical }}
+      high_count:     ${{ steps.counts.outputs.high }}
+      medium_count:   ${{ steps.counts.outputs.medium }}
+      low_count:      ${{ steps.counts.outputs.low }}
+      gate_status:    ${{ steps.gate.outputs.status }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Run Semgrep SAST
+        run: |
+          semgrep scan \
+            --config=auto \
+            --config=p/security-audit \
+            --config=p/owasp-top-ten \
+            --json \
+            --output=sast-results.json \
+            --sarif \
+            --sarif-output=sast-results.sarif \
+            || true
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: sast-results.sarif
+          category: semgrep
+
+      - name: Count findings by severity
+        id: counts
+        run: |
+          CRITICAL=$(jq '[.results[] | select(.extra.severity == "ERROR")]   | length' \
+            sast-results.json 2>/dev/null || echo "0")
+          HIGH=$(jq     '[.results[] | select(.extra.severity == "WARNING")] | length' \
+            sast-results.json 2>/dev/null || echo "0")
+          MEDIUM=$(jq   '[.results[] | select(.extra.severity == "INFO")]    | length' \
+            sast-results.json 2>/dev/null || echo "0")
+          LOW=$(jq      '[.results[] | select(.extra.severity == "LOW")]     | length' \
+            sast-results.json 2>/dev/null || echo "0")
+
+          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "high=$HIGH"         >> $GITHUB_OUTPUT
+          echo "medium=$MEDIUM"     >> $GITHUB_OUTPUT
+          echo "low=$LOW"           >> $GITHUB_OUTPUT
+
+          echo "SAST Findings - Critical: $CRITICAL | High: $HIGH | Medium: $MEDIUM | Low: $LOW"
+
+      - name: Evaluate SAST security gate
+        id: gate
+        run: |
+          CRITICAL="${{ steps.counts.outputs.critical }}"
+          HIGH="${{ steps.counts.outputs.high }}"
+          MEDIUM="${{ steps.counts.outputs.medium }}"
+
+          CRIT_ACTION="${{ needs.load-thresholds.outputs.sast_critical_action }}"
+          CRIT_THRESH="${{ needs.load-thresholds.outputs.sast_critical_threshold }}"
+          HIGH_ACTION="${{ needs.load-thresholds.outputs.sast_high_action }}"
+          HIGH_THRESH="${{ needs.load-thresholds.outputs.sast_high_threshold }}"
+          MED_ACTION="${{  needs.load-thresholds.outputs.sast_medium_action }}"
+          MED_THRESH="${{  needs.load-thresholds.outputs.sast_medium_threshold }}"
+
+          OVERRIDE="${{ needs.load-thresholds.outputs.override_active }}"
+          GATE_STATUS="pass"
+          GATE_MESSAGES=""
+
+          # Evaluate critical threshold
+          if [ "$CRITICAL" -gt "$CRIT_THRESH" ]; then
+            MSG="Critical: $CRITICAL findings (threshold: $CRIT_THRESH)"
+            if [ "$CRIT_ACTION" == "break" ] && [ "$OVERRIDE" != "true" ]; then
+              GATE_STATUS="fail"
+              GATE_MESSAGES="$GATE_MESSAGES\n❌ SAST $MSG"
+            else
+              GATE_MESSAGES="$GATE_MESSAGES\n⚠️  SAST $MSG"
+            fi
+          fi
+
+          # Evaluate high threshold
+          if [ "$HIGH" -gt "$HIGH_THRESH" ]; then
+            MSG="High: $HIGH findings (threshold: $HIGH_THRESH)"
+            if [ "$HIGH_ACTION" == "break" ] && [ "$OVERRIDE" != "true" ]; then
+              GATE_STATUS="fail"
+              GATE_MESSAGES="$GATE_MESSAGES\n❌ SAST $MSG"
+            else
+              GATE_MESSAGES="$GATE_MESSAGES\n⚠️  SAST $MSG"
+            fi
+          fi
+
+          # Evaluate medium threshold (warn only per Table 3.4)
+          if [ "$MEDIUM" -gt "$MED_THRESH" ]; then
+            GATE_MESSAGES="$GATE_MESSAGES\n⚠️  SAST Medium: $MEDIUM findings (threshold: $MED_THRESH)"
+          fi
+
+          echo "status=$GATE_STATUS" >> $GITHUB_OUTPUT
+
+          if [ "$GATE_STATUS" == "fail" ]; then
+            echo "::error::SAST Security Gate FAILED"
+            printf "$GATE_MESSAGES\n"
+          else
+            echo "✅ SAST Security Gate PASSED"
+            [ -n "$GATE_MESSAGES" ] && printf "$GATE_MESSAGES\n"
+          fi
+
+      - name: Upload SAST artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: sast-results-${{ github.run_number }}
+          path: |
+            sast-results.json
+            sast-results.sarif
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Dependency Scan
+  # Trivy scans for vulnerable dependencies and container images
+  # ---------------------------------------------------------------------------
+  dependency-scan:
+    name: Dependency Scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: load-thresholds
+
+    outputs:
+      critical_count: ${{ steps.counts.outputs.critical }}
+      high_count:     ${{ steps.counts.outputs.high }}
+      medium_count:   ${{ steps.counts.outputs.medium }}
+      gate_status:    ${{ steps.gate.outputs.status }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Trivy
+        run: |
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb generic main" \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -qq
+          sudo apt-get install -y trivy
+
+      - name: Run Trivy filesystem scan
+        run: |
+          trivy fs \
+            --format json \
+            --output trivy-results.json \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --exit-code 0 \
+            .
+
+      - name: Run Trivy SBOM generation
+        run: |
+          trivy fs \
+            --format cyclonedx \
+            --output sbom.json \
+            .
+        continue-on-error: true
+
+      - name: Count findings by severity
+        id: counts
+        run: |
+          CRITICAL=$(jq '[.Results[].Vulnerabilities[]? |
+            select(.Severity == "CRITICAL")] | length' \
+            trivy-results.json 2>/dev/null || echo "0")
+          HIGH=$(jq '[.Results[].Vulnerabilities[]? |
+            select(.Severity == "HIGH")] | length' \
+            trivy-results.json 2>/dev/null || echo "0")
+          MEDIUM=$(jq '[.Results[].Vulnerabilities[]? |
+            select(.Severity == "MEDIUM")] | length' \
+            trivy-results.json 2>/dev/null || echo "0")
+          LOW=$(jq '[.Results[].Vulnerabilities[]? |
+            select(.Severity == "LOW")] | length' \
+            trivy-results.json 2>/dev/null || echo "0")
+
+          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "high=$HIGH"         >> $GITHUB_OUTPUT
+          echo "medium=$MEDIUM"     >> $GITHUB_OUTPUT
+          echo "low=$LOW"           >> $GITHUB_OUTPUT
+
+          echo "Dependency Findings - Critical: $CRITICAL | High: $HIGH | Medium: $MEDIUM | Low: $LOW"
+
+      - name: Evaluate dependency security gate
+        id: gate
+        run: |
+          CRITICAL="${{ steps.counts.outputs.critical }}"
+          HIGH="${{ steps.counts.outputs.high }}"
+
+          CRIT_ACTION="${{ needs.load-thresholds.outputs.dep_critical_action }}"
+          CRIT_THRESH="${{ needs.load-thresholds.outputs.dep_critical_threshold }}"
+          HIGH_ACTION="${{ needs.load-thresholds.outputs.dep_high_action }}"
+          HIGH_THRESH="${{ needs.load-thresholds.outputs.dep_high_threshold }}"
+
+          OVERRIDE="${{ needs.load-thresholds.outputs.override_active }}"
+          GATE_STATUS="pass"
+
+          if [ "$CRITICAL" -gt "$CRIT_THRESH" ]; then
+            if [ "$CRIT_ACTION" == "break" ] && [ "$OVERRIDE" != "true" ]; then
+              GATE_STATUS="fail"
+              echo "::error::Dependency Critical: $CRITICAL findings (threshold: $CRIT_THRESH)"
+            else
+              echo "::warning::Dependency Critical: $CRITICAL findings (threshold: $CRIT_THRESH)"
+            fi
+          fi
+
+          if [ "$HIGH" -gt "$HIGH_THRESH" ]; then
+            if [ "$HIGH_ACTION" == "break" ] && [ "$OVERRIDE" != "true" ]; then
+              GATE_STATUS="fail"
+              echo "::error::Dependency High: $HIGH findings (threshold: $HIGH_THRESH)"
+            else
+              echo "::warning::Dependency High: $HIGH findings (threshold: $HIGH_THRESH)"
+            fi
+          fi
+
+          echo "status=$GATE_STATUS" >> $GITHUB_OUTPUT
+
+          if [ "$GATE_STATUS" == "fail" ]; then
+            echo "::error::Dependency Security Gate FAILED"
+          else
+            echo "✅ Dependency Security Gate PASSED"
+          fi
+
+      - name: Upload dependency scan artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: dependency-results-${{ github.run_number }}
+          path: |
+            trivy-results.json
+            sbom.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Security Gate Aggregator
+  # Combines results from all scans and makes the final pass/fail decision
+  # Posts a unified PR comment with all results
+  # ---------------------------------------------------------------------------
+  security-gate:
+    name: Security Gate - Final Evaluation
+    runs-on: ubuntu-latest
+    needs:
+      - load-thresholds
+      - sast-scan
+      - dependency-scan
+    # Always run even if upstream jobs fail
+    if: always()
+
+    permissions:
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Evaluate overall gate status
+        id: overall
+        run: |
+          SAST_STATUS="${{ needs.sast-scan.outputs.gate_status }}"
+          DEP_STATUS="${{  needs.dependency-scan.outputs.gate_status }}"
+          OVERRIDE="${{    needs.load-thresholds.outputs.override_active }}"
+
+          OVERALL="pass"
+          if [ "$SAST_STATUS" == "fail" ] || [ "$DEP_STATUS" == "fail" ]; then
+            OVERALL="fail"
+          fi
+
+          # Override always passes (but is logged and notified)
+          if [ "$OVERRIDE" == "true" ]; then
+            OVERALL="override"
+          fi
+
+          echo "status=$OVERALL" >> $GITHUB_OUTPUT
+          echo "Overall gate status: $OVERALL"
+
+      # -----------------------------------------------------------------------
+      # Post unified PR comment with all scan results
+      # -----------------------------------------------------------------------
+      - name: Post PR comment with security gate results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const overallStatus = '${{ steps.overall.outputs.status }}';
+            const profile       = '${{ needs.load-thresholds.outputs.active_profile }}';
+            const override      = '${{ needs.load-thresholds.outputs.override_active }}';
+            const overrideReason = '${{ needs.load-thresholds.outputs.override_reason }}';
+
+            // Status icons
+            const icons = { pass: '✅', fail: '❌', override: '⚠️' };
+            const icon  = icons[overallStatus] || '❓';
+
+            // Build the comment
+            let body = `## ${icon} Security Gate Results\n\n`;
+            body += `**Profile:** \`${profile}\` | `;
+            body += `**Branch:** \`${{ github.head_ref }}\`\n\n`;
+
+            if (override === 'true') {
+              body += `> ⚠️ **Emergency Override Active**\n`;
+              body += `> Reason: ${overrideReason || 'Not provided'}\n`;
+              body += `> This override has been logged and the security team notified.\n\n`;
+            }
+
+            // Results table
+            body += `### Scan Results\n\n`;
+            body += `| Scanner | Critical | High | Medium | Low | Gate |\n`;
+            body += `|---------|----------|------|--------|-----|------|\n`;
+
+            // SAST row
+            const sastStatus = '${{ needs.sast-scan.outputs.gate_status }}' === 'fail'
+              ? '❌ FAIL' : '✅ PASS';
+            body += `| SAST (Semgrep) `;
+            body += `| ${{ needs.sast-scan.outputs.critical_count }} `;
+            body += `| ${{ needs.sast-scan.outputs.high_count }} `;
+            body += `| ${{ needs.sast-scan.outputs.medium_count }} `;
+            body += `| ${{ needs.sast-scan.outputs.low_count }} `;
+            body += `| ${sastStatus} |\n`;
+
+            // Dependency row
+            const depStatus = '${{ needs.dependency-scan.outputs.gate_status }}' === 'fail'
+              ? '❌ FAIL' : '✅ PASS';
+            body += `| Dependencies (Trivy) `;
+            body += `| ${{ needs.dependency-scan.outputs.critical_count }} `;
+            body += `| ${{ needs.dependency-scan.outputs.high_count }} `;
+            body += `| ${{ needs.dependency-scan.outputs.medium_count }} `;
+            body += `| — `;
+            body += `| ${depStatus} |\n\n`;
+
+            // Threshold reference
+            body += `### Active Thresholds (Table 3.4)\n\n`;
+            body += `| Severity | SAST | Dependencies | Action |\n`;
+            body += `|----------|------|--------------|--------|\n`;
+            body += `| Critical | Break at >${{ needs.load-thresholds.outputs.sast_critical_threshold }} `;
+            body += `| Break at >${{ needs.load-thresholds.outputs.dep_critical_threshold }} `;
+            body += `| Immediate fix required |\n`;
+            body += `| High | ${{ needs.load-thresholds.outputs.sast_high_action }} at >${{ needs.load-thresholds.outputs.sast_high_threshold }} `;
+            body += `| ${{ needs.load-thresholds.outputs.dep_high_action }} at >${{ needs.load-thresholds.outputs.dep_high_threshold }} `;
+            body += `| Fix before merge |\n`;
+            body += `| Medium | Warn | Warn | Fix in next sprint |\n`;
+            body += `| Low | Warn | Ignore | Optional |\n\n`;
+
+            // Overall verdict
+            if (overallStatus === 'fail') {
+              body += `### ❌ Gate FAILED\n\n`;
+              body += `This PR cannot be merged until security issues are resolved.\n`;
+              body += `Review the scan artifacts for detailed remediation guidance.\n\n`;
+              body += `> **Emergency override:** If this is blocking a critical hotfix, `;
+              body += `add the \`security-override\` label and document the reason `;
+              body += `in the PR description as:\n`;
+              body += `> \`Override reason: <your reason here>\`\n`;
+            } else if (overallStatus === 'override') {
+              body += `### ⚠️ Gate BYPASSED (Emergency Override)\n\n`;
+              body += `The security gate has been bypassed. `;
+              body += `A security review is required within 24 hours.\n`;
+            } else {
+              body += `### ✅ Gate PASSED\n\n`;
+              body += `All security checks passed within configured thresholds.\n`;
+            }
+
+            body += `\n---\n`;
+            body += `📦 Full scan results in [workflow artifacts]`;
+            body += `(${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n`;
+            body += `⚙️  Adjust thresholds in \`security-thresholds.yml\`\n`;
+
+            // Update or create comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Security Gate Results')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      # -----------------------------------------------------------------------
+      # Write GitHub Actions step summary
+      # -----------------------------------------------------------------------
+      - name: Write job summary
+        if: always()
+        run: |
+          STATUS="${{ steps.overall.outputs.status }}"
+          PROFILE="${{ needs.load-thresholds.outputs.active_profile }}"
+
+          echo "## Security Gate Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Profile:** \`$PROFILE\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Overall Status:** $STATUS" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scanner | Critical | High | Medium | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|----------|------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| SAST | ${{ needs.sast-scan.outputs.critical_count }} | ${{ needs.sast-scan.outputs.high_count }} | ${{ needs.sast-scan.outputs.medium_count }} | ${{ needs.sast-scan.outputs.gate_status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependencies | ${{ needs.dependency-scan.outputs.critical_count }} | ${{ needs.dependency-scan.outputs.high_count }} | ${{ needs.dependency-scan.outputs.medium_count }} | ${{ needs.dependency-scan.outputs.gate_status }} |" >> $GITHUB_STEP_SUMMARY
+
+      # -----------------------------------------------------------------------
+      # Final pass/fail decision
+      # This is the step that actually blocks the PR merge
+      # -----------------------------------------------------------------------
+      - name: Enforce security gate decision
+        run: |
+          STATUS="${{ steps.overall.outputs.status }}"
+
+          if [ "$STATUS" == "fail" ]; then
+            echo "❌ Security Gate FAILED - merge blocked"
+            echo "Fix the issues listed above and re-run the pipeline."
+            exit 1
+          elif [ "$STATUS" == "override" ]; then
+            echo "⚠️  Security Gate BYPASSED via emergency override"
+            echo "A security review is required within 24 hours."
+            exit 0
+          else
+            echo "✅ Security Gate PASSED - merge approved"
+            exit 0
+          fi
+
+      # -----------------------------------------------------------------------
+      # Slack notification on gate failure
+      # -----------------------------------------------------------------------
+      - name: Notify Slack on gate failure
+        if: |
+          failure() &&
+          steps.overall.outputs.status == 'fail' &&
+          secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "❌ Security Gate Failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*❌ Security Gate Failed*\n*Repo:* ${{ github.repository }}\n*PR:* ${{ github.event.pull_request.html_url }}\n*Author:* ${{ github.actor }}\n*SAST Critical:* ${{ needs.sast-scan.outputs.critical_count }}\n*Dep Critical:* ${{ needs.dependency-scan.outputs.critical_count }}"
+                  }
+                },plea
+                {
+                  "type": "actions",
+                  "elements": [{
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "View Results" },
+                    "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

@@ -1,0 +1,425 @@
+# =============================================================================
+# Security Gate Thresholds Configuration
+# Book Reference: Chapter 3, Section 3.2.1.2
+# =============================================================================
+#
+# This file centralizes all security threshold configuration.
+# Reference it from your CI/CD pipeline to avoid hardcoding thresholds.
+#
+# USAGE:
+#   - Copy to your repository root as security-thresholds.yml
+#   - Reference in GitHub Actions, GitLab CI, or Jenkins
+#   - Override per-environment using the environment_overrides section
+#   - Override per-project using the project_overrides section
+#
+# PHILOSOPHY (Section 3.2.1.3 - Balancing Security and Velocity):
+#   Week 1-2 : Use the 'learning' profile  - no build breaks
+#   Week 3-4 : Use the 'warning' profile   - break on critical only
+#   Week 5+  : Use the 'enforcement' profile - break on critical + high
+#
+# TABLE 3.4 REFERENCE:
+#   Severity   SAST        DAST        Dependency   Action
+#   Critical   Break       Break       Break        Immediate fix required
+#   High       Break (>3)  Break (>2)  Break (>5)   Fix before merge
+#   Medium     Warn        Warn        Warn         Fix in next sprint
+#   Low        Warn        Warn        Ignore       Optional fix
+# =============================================================================
+
+# =============================================================================
+# Schema version - increment when making breaking changes
+# =============================================================================
+version: "1.0"
+
+# =============================================================================
+# Active profile
+# Options: learning | warning | enforcement | custom
+# Change this as your team matures (see Section 3.2.1.3)
+# =============================================================================
+active_profile: enforcement
+
+# =============================================================================
+# Profiles
+# Each profile maps to a phase in the Section 3.2.1.3 rollout plan
+# =============================================================================
+profiles:
+
+  # ---------------------------------------------------------------------------
+  # Week 1-2: Learning Mode
+  # Never break builds - collect data and understand your baseline
+  # ---------------------------------------------------------------------------
+  learning:
+    description: >
+      Learning mode - builds never break. Use this for the first 1-2 weeks
+      to collect data on findings and understand your false positive rate
+      before enforcing any thresholds.
+
+    sast:
+      critical:
+        action: warn          # warn | break
+        threshold: 999        # Number of findings before action triggers
+      high:
+        action: warn
+        threshold: 999
+      medium:
+        action: warn
+        threshold: 999
+      low:
+        action: ignore        # warn | ignore
+
+    dast:
+      critical:
+        action: warn
+        threshold: 999
+      high:
+        action: warn
+        threshold: 999
+      medium:
+        action: warn
+        threshold: 999
+      low:
+        action: ignore
+
+    dependency:
+      critical:
+        action: warn
+        threshold: 999
+      high:
+        action: warn
+        threshold: 999
+      medium:
+        action: warn
+        threshold: 999
+      low:
+        action: ignore
+
+  # ---------------------------------------------------------------------------
+  # Week 3-4: Warning Mode
+  # Break on critical only - train the team on fixing issues
+  # ---------------------------------------------------------------------------
+  warning:
+    description: >
+      Warning mode - only critical findings break the build. Use this for
+      weeks 3-4 to train the team on fixing issues while maintaining velocity.
+
+    sast:
+      critical:
+        action: break
+        threshold: 0          # Any critical finding breaks the build
+      high:
+        action: warn
+        threshold: 999
+      medium:
+        action: warn
+        threshold: 999
+      low:
+        action: ignore
+
+    dast:
+      critical:
+        action: break
+        threshold: 0
+      high:
+        action: warn
+        threshold: 999
+      medium:
+        action: warn
+        threshold: 999
+      low:
+        action: ignore
+
+    dependency:
+      critical:
+        action: break
+        threshold: 0
+      high:
+        action: warn
+        threshold: 999
+      medium:
+        action: warn
+        threshold: 999
+      low:
+        action: ignore
+
+  # ---------------------------------------------------------------------------
+  # Week 5+: Enforcement Mode (Table 3.4 thresholds)
+  # Break on critical + high above threshold - full enforcement
+  # ---------------------------------------------------------------------------
+  enforcement:
+    description: >
+      Enforcement mode - implements Table 3.4 thresholds from the book.
+      Critical always breaks. High breaks above threshold. Medium warns.
+      Review thresholds quarterly and tighten as the team improves.
+
+    sast:
+      critical:
+        action: break
+        threshold: 0          # Any critical finding breaks the build
+      high:
+        action: break
+        threshold: 3          # Break if more than 3 high findings (Table 3.4)
+      medium:
+        action: warn
+        threshold: 10         # Warn if more than 10 medium findings
+      low:
+        action: warn
+        threshold: 999
+
+    dast:
+      critical:
+        action: break
+        threshold: 0
+      high:
+        action: break
+        threshold: 2          # Break if more than 2 high findings (Table 3.4)
+      medium:
+        action: warn
+        threshold: 5
+      low:
+        action: ignore
+
+    dependency:
+      critical:
+        action: break
+        threshold: 0
+      high:
+        action: break
+        threshold: 5          # Break if more than 5 high findings (Table 3.4)
+      medium:
+        action: warn
+        threshold: 15
+      low:
+        action: ignore
+
+  # ---------------------------------------------------------------------------
+  # Custom: Override individual thresholds
+  # Use this when the standard profiles don't fit your team's needs
+  # ---------------------------------------------------------------------------
+  custom:
+    description: >
+      Custom thresholds - configure each value independently.
+      Use this when standard profiles don't fit your specific context.
+
+    sast:
+      critical:
+        action: break
+        threshold: 0
+      high:
+        action: break
+        threshold: 5          # Adjust to your team's capacity
+      medium:
+        action: warn
+        threshold: 20
+      low:
+        action: ignore
+
+    dast:
+      critical:
+        action: break
+        threshold: 0
+      high:
+        action: break
+        threshold: 3
+      medium:
+        action: warn
+        threshold: 10
+      low:
+        action: ignore
+
+    dependency:
+      critical:
+        action: break
+        threshold: 0
+      high:
+        action: break
+        threshold: 10
+      medium:
+        action: warn
+        threshold: 25
+      low:
+        action: ignore
+
+# =============================================================================
+# Environment-specific overrides
+# These override the active profile for specific deployment environments
+# =============================================================================
+environment_overrides:
+
+  # Production branch - always use strictest thresholds regardless of profile
+  production:
+    description: >
+      Production deployments always use zero-tolerance thresholds.
+      No security findings of any severity are acceptable in production.
+    applies_to_branches:
+      - main
+      - master
+      - release/*
+    sast:
+      critical: { action: break, threshold: 0 }
+      high:     { action: break, threshold: 0 }
+      medium:   { action: break, threshold: 0 }
+      low:      { action: warn,  threshold: 999 }
+    dast:
+      critical: { action: break, threshold: 0 }
+      high:     { action: break, threshold: 0 }
+      medium:   { action: warn,  threshold: 5 }
+      low:      { action: ignore }
+    dependency:
+      critical: { action: break, threshold: 0 }
+      high:     { action: break, threshold: 0 }
+      medium:   { action: warn,  threshold: 10 }
+      low:      { action: ignore }
+
+  # Staging - slightly more lenient than production
+  staging:
+    description: Staging environment thresholds
+    applies_to_branches:
+      - staging
+      - develop
+    sast:
+      critical: { action: break, threshold: 0 }
+      high:     { action: break, threshold: 2 }
+      medium:   { action: warn,  threshold: 10 }
+      low:      { action: warn,  threshold: 999 }
+    dast:
+      critical: { action: break, threshold: 0 }
+      high:     { action: break, threshold: 2 }
+      medium:   { action: warn,  threshold: 5 }
+      low:      { action: ignore }
+    dependency:
+      critical: { action: break, threshold: 0 }
+      high:     { action: break, threshold: 3 }
+      medium:   { action: warn,  threshold: 15 }
+      low:      { action: ignore }
+
+  # Feature branches - most lenient, focus on critical only
+  feature:
+    description: Feature branch thresholds - focus on critical issues only
+    applies_to_branches:
+      - feature/*
+      - fix/*
+      - hotfix/*
+    sast:
+      critical: { action: break, threshold: 0 }
+      high:     { action: warn,  threshold: 5 }
+      medium:   { action: warn,  threshold: 999 }
+      low:      { action: ignore }
+    dast:
+      critical: { action: break, threshold: 0 }
+      high:     { action: warn,  threshold: 999 }
+      medium:   { action: ignore }
+      low:      { action: ignore }
+    dependency:
+      critical: { action: break, threshold: 0 }
+      high:     { action: warn,  threshold: 10 }
+      medium:   { action: ignore }
+      low:      { action: ignore }
+
+# =============================================================================
+# Emergency override configuration
+# Allows bypassing security gates in genuine emergencies
+# =============================================================================
+emergency_override:
+  # Whether to allow emergency overrides at all
+  enabled: true
+
+  # How to trigger an override:
+  #   GitHub Actions : Add label 'security-override' to the PR
+  #   GitLab CI      : Set CI variable SECURITY_OVERRIDE=true
+  #   Jenkins        : Set parameter SECURITY_OVERRIDE=true
+
+  # Who can approve overrides (GitHub usernames / GitLab usernames)
+  # Leave empty to allow any maintainer
+  approved_users:
+    - security-lead
+    - cto
+    - vp-engineering
+
+  # Require a reason to be documented
+  require_reason: true
+
+  # Maximum number of overrides per month before alerting security team
+  monthly_limit: 3
+
+  # Always notify these people when an override is used
+  notify:
+    - security-team@yourcompany.com
+
+# =============================================================================
+# Notification configuration
+# =============================================================================
+notifications:
+  # Notify on build break
+  on_break:
+    slack:
+      enabled: true
+      channel: "#security-alerts"
+    email:
+      enabled: true
+      recipients:
+        - security-team@yourcompany.com
+        - dev-lead@yourcompany.com
+
+  # Notify on warning threshold exceeded
+  on_warn:
+    slack:
+      enabled: true
+      channel: "#dev-security"
+    email:
+      enabled: false
+
+  # Weekly summary of security findings across all projects
+  weekly_summary:
+    enabled: true
+    day: monday
+    time: "09:00"
+    recipients:
+      - security-team@yourcompany.com
+      - engineering-leads@yourcompany.com
+
+# =============================================================================
+# Scan tool configuration
+# Maps tool output formats to the threshold evaluation logic
+# =============================================================================
+tools:
+  sast:
+    primary: semgrep
+    severity_mapping:
+      # Maps tool-specific severity names to our standard levels
+      semgrep:
+        ERROR:   critical
+        WARNING: high
+        INFO:    low
+      sonarqube:
+        BLOCKER:  critical
+        CRITICAL: high
+        MAJOR:    medium
+        MINOR:    low
+        INFO:     low
+      codeql:
+        error:   critical
+        warning: high
+        note:    low
+
+  dependency:
+    primary: trivy
+    severity_mapping:
+      trivy:
+        CRITICAL: critical
+        HIGH:     high
+        MEDIUM:   medium
+        LOW:      low
+        UNKNOWN:  low
+      snyk:
+        critical: critical
+        high:     high
+        medium:   medium
+        low:      low
+
+  dast:
+    primary: zap
+    severity_mapping:
+      zap:
+        "3": critical    # ZAP uses numeric risk codes
+        "2": high
+        "1": medium
+        "0": low

@@ -1,0 +1,97 @@
+[
+  {
+    "_comment": "Alert 1: Brute Force Detection (Section 2.10.6)",
+    "_comment2": "Import via: datadog-monitors.sh or Datadog UI → Monitors → New Monitor → Import",
+    "name": "[Security] Brute Force Detection",
+    "type": "log alert",
+    "query": "logs(\"@event:auth.login.failure\").index(\"*\").rollup(\"count\").by(\"@ip\").last(\"15m\") >= 5",
+    "message": "## Brute Force Attack Detected\n\n**Alert 1** — Chapter 2.10.6\n\n5 or more failed login attempts from the same IP in the last 15 minutes.\n\n**IP Address:** {{@ip.name}}\n**Count:** {{value}} failed attempts\n\n### Immediate Actions\n1. Review the attempts: [Log Explorer](https://app.datadoghq.com/logs?query=%40event%3Aauth.login.failure%20%40ip%3A{{@ip.name}})\n2. Consider blocking the IP at your WAF or load balancer\n3. Check if any attempts succeeded: filter for `auth.login.success` from the same IP\n\n{{#is_alert}}@{{ALERT_EMAIL}}{{/is_alert}}",
+    "tags": [
+      "security:brute-force",
+      "alert:1",
+      "chapter:2.10.6"
+    ],
+    "options": {
+      "notify_no_data": false,
+      "renotify_interval": 60,
+      "renotify_occurrences": 3,
+      "escalation_message": "Brute force alert still active after 1 hour. Escalating.",
+      "thresholds": {
+        "critical": 5,
+        "warning": 3
+      },
+      "notify_audit": true,
+      "include_tags": true,
+      "groupby_simple_monitor": false
+    },
+    "priority": 2
+  },
+
+  {
+    "_comment": "Alert 2: Authorization Failure Spike (Section 2.10.6)",
+    "name": "[Security] Authorization Failure Spike",
+    "type": "log alert",
+    "query": "logs(\"@event:authz.failure\").index(\"*\").rollup(\"count\").by(\"@userId\").last(\"5m\") >= 10",
+    "message": "## Authorization Failure Spike\n\n**Alert 2** — Chapter 2.10.6\n\n10 or more authorization failures from the same user in the last 5 minutes.\n\n**User ID:** {{@userId.name}}\n**Count:** {{value}} failures\n\n### Immediate Actions\n1. Review the failures: [Log Explorer](https://app.datadoghq.com/logs?query=%40event%3Aauthz.failure%20%40userId%3A{{@userId.name}})\n2. Check what resources the user was attempting to access\n3. Review whether the user's role or permissions have changed recently\n4. Consider temporarily suspending the account if activity looks malicious\n\n{{#is_alert}}@{{ALERT_EMAIL}}{{/is_alert}}",
+    "tags": [
+      "security:authz",
+      "alert:2",
+      "chapter:2.10.6"
+    ],
+    "options": {
+      "notify_no_data": false,
+      "renotify_interval": 30,
+      "thresholds": {
+        "critical": 10,
+        "warning": 5
+      },
+      "notify_audit": true,
+      "include_tags": true
+    },
+    "priority": 2
+  },
+
+  {
+    "_comment": "Alert 3: Security Event (Section 2.10.6)",
+    "name": "[Security] Security Event Detected",
+    "type": "log alert",
+    "query": "logs(\"@event:security.event\").index(\"*\").rollup(\"count\").last(\"1m\") >= 1",
+    "message": "## Security Event Logged\n\n**Alert 3** — Chapter 2.10.6\n\nA security event has been logged. Requires immediate review.\n\n**Count:** {{value}} event(s)\n\n### Immediate Actions\n1. Review the events: [Log Explorer](https://app.datadoghq.com/logs?query=%40event%3Asecurity.event)\n2. Identify the event type and affected user/IP\n3. Escalate to on-call if the event indicates active compromise\n\n{{#is_alert}}@{{ALERT_EMAIL}}{{/is_alert}}",
+    "tags": [
+      "security:event",
+      "alert:3",
+      "chapter:2.10.6"
+    ],
+    "options": {
+      "notify_no_data": false,
+      "renotify_interval": 15,
+      "thresholds": {
+        "critical": 1
+      },
+      "notify_audit": true,
+      "include_tags": true
+    },
+    "priority": 1
+  },
+
+  {
+    "_comment": "Bonus: Privilege Change",
+    "name": "[Security] Privilege Change Detected",
+    "type": "log alert",
+    "query": "logs(\"@event:authz.privilege.change\").index(\"*\").rollup(\"count\").last(\"1m\") >= 1",
+    "message": "## Privilege Change Detected\n\nA user's role or permissions have been changed.\n\n**Count:** {{value}} change(s)\n\n### Immediate Actions\n1. Review the change: [Log Explorer](https://app.datadoghq.com/logs?query=%40event%3Aauthz.privilege.change)\n2. Verify the change was authorized\n3. If unexpected, revert the change and investigate\n\n{{#is_alert}}@{{ALERT_EMAIL}}{{/is_alert}}",
+    "tags": [
+      "security:privilege",
+      "chapter:2.10.6"
+    ],
+    "options": {
+      "notify_no_data": false,
+      "renotify_interval": 60,
+      "thresholds": {
+        "critical": 1
+      },
+      "notify_audit": true
+    },
+    "priority": 2
+  }
+]

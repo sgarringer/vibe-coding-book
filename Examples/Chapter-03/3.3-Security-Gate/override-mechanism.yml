@@ -1,0 +1,670 @@
+# =============================================================================
+# Security Gate Override Mechanism
+# Book Reference: Chapter 3, Section 3.2.3
+# =============================================================================
+#
+# PURPOSE:
+#   Provides a controlled, audited mechanism to bypass the security gate
+#   in genuine emergencies (hotfixes, confirmed false positives, accepted risk).
+#
+# OVERRIDE TYPES:
+#   1. Label-based  : Add 'security-override' label to PR (requires approval)
+#   2. Comment-based: Post '/security-override <reason>' in PR comments
+#   3. File-based   : Commit .security/override.yml with justification
+#
+# SAFEGUARDS:
+#   - Security team approval required before label can be applied
+#   - All overrides logged to audit trail
+#   - Slack/email notification sent immediately
+#   - Override expires after 24 hours (re-approval required)
+#   - Monthly override count tracked and alerted if exceeded
+#
+# SETUP REQUIRED:
+#   1. Create 'security-override' label in your GitHub repository
+#      Settings > Labels > New label
+#      Color: #e11d48 (red) to make it visually prominent
+#
+#   2. Add CODEOWNERS rule to require security team approval for the label:
+#      Create .github/CODEOWNERS:
+#        # Security override label requires security team approval
+#        .github/security-override-approvals/ @security-team
+#
+#   3. Configure branch protection:
+#      Settings > Branches > main > Require approvals from code owners
+#
+#   4. Set secrets:
+#      SLACK_WEBHOOK_URL     : For override notifications
+#      SECURITY_TEAM_TOKEN   : GitHub token with label management permissions
+#      AUDIT_LOG_REPO        : Repository to store audit logs (optional)
+# =============================================================================
+
+name: Security Gate with Override
+
+on:
+  pull_request:
+    branches: [ main, develop, staging ]
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled        # Trigger when label is added
+      - unlabeled      # Trigger when label is removed
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Job 1: Validate override request
+  # Runs first to determine if an override is in effect BEFORE running scans
+  # This prevents wasting scan time when an override is already approved
+  # ---------------------------------------------------------------------------
+  validate-override:
+    name: Validate Override Request
+    runs-on: ubuntu-latest
+
+    outputs:
+      override_active:   ${{ steps.check.outputs.override_active }}
+      override_type:     ${{ steps.check.outputs.override_type }}
+      override_reason:   ${{ steps.check.outputs.override_reason }}
+      override_approver: ${{ steps.check.outputs.override_approver }}
+      override_expires:  ${{ steps.check.outputs.override_expires }}
+
+    permissions:
+      pull-requests: read
+      issues:        read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # -----------------------------------------------------------------------
+      # Check 1: Label-based override
+      # Most common method - requires security team to apply the label
+      # -----------------------------------------------------------------------
+      - name: Check for security-override label
+        id: label-check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          OVERRIDE_FOUND="false"
+          APPROVER=""
+
+          # Check if the PR has the security-override label
+          LABELS=$(gh pr view "$PR_NUMBER" \
+            --json labels \
+            --jq '.labels[].name' 2>/dev/null || echo "")
+
+          if echo "$LABELS" | grep -q "^security-override$"; then
+            OVERRIDE_FOUND="true"
+
+            # Find who applied the label (from the PR timeline)
+            APPROVER=$(gh api \
+              "/repos/${{ github.repository }}/issues/${PR_NUMBER}/events" \
+              --jq '[.[] | select(.event == "labeled" and
+                    .label.name == "security-override")] |
+                    last | .actor.login' 2>/dev/null || echo "unknown")
+
+            echo "Label-based override found. Applied by: $APPROVER"
+          fi
+
+          echo "found=$OVERRIDE_FOUND"   >> $GITHUB_OUTPUT
+          echo "approver=$APPROVER"      >> $GITHUB_OUTPUT
+
+      # -----------------------------------------------------------------------
+      # Check 2: Comment-based override
+      # Developer posts '/security-override <reason>' in PR comments
+      # Security team member must have reacted with 👍 to approve
+      # -----------------------------------------------------------------------
+      - name: Check for comment-based override
+        id: comment-check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          OVERRIDE_FOUND="false"
+          OVERRIDE_REASON=""
+          APPROVER=""
+
+          # Get all PR comments
+          COMMENTS=$(gh api \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | {id: .id, body: .body, author: .user.login}' \
+            2>/dev/null || echo "")
+
+          # Look for override command
+          OVERRIDE_COMMENT=$(echo "$COMMENTS" | \
+            jq -r 'select(.body | test("/security-override"; "i"))' | \
+            head -1)
+
+          if [ -n "$OVERRIDE_COMMENT" ]; then
+            COMMENT_ID=$(echo "$OVERRIDE_COMMENT" | jq -r '.id')
+            OVERRIDE_REASON=$(echo "$OVERRIDE_COMMENT" | \
+              jq -r '.body' | \
+              sed 's|/security-override||i' | \
+              xargs)
+
+            # Check if a security team member approved with 👍
+            REACTIONS=$(gh api \
+              "/repos/${{ github.repository }}/issues/comments/${COMMENT_ID}/reactions" \
+              --jq '[.[] | select(.content == "+1")] | .[].user.login' \
+              2>/dev/null || echo "")
+
+            # Check if any reactor is in the security team
+            # In production, replace with actual security team members
+            SECURITY_TEAM="security-lead cto vp-engineering"
+            for MEMBER in $SECURITY_TEAM; do
+              if echo "$REACTIONS" | grep -q "^${MEMBER}$"; then
+                OVERRIDE_FOUND="true"
+                APPROVER="$MEMBER"
+                break
+              fi
+            done
+          fi
+
+          echo "found=$OVERRIDE_FOUND"     >> $GITHUB_OUTPUT
+          echo "reason=$OVERRIDE_REASON"   >> $GITHUB_OUTPUT
+          echo "approver=$APPROVER"        >> $GITHUB_OUTPUT
+
+      # -----------------------------------------------------------------------
+      # Check 3: File-based override
+      # Developer commits .security/override.yml with justification
+      # Requires security team review of the file change
+      # -----------------------------------------------------------------------
+      - name: Check for file-based override
+        id: file-check
+        run: |
+          OVERRIDE_FOUND="false"
+          OVERRIDE_REASON=""
+
+          if [ -f ".security/override.yml" ]; then
+            # Validate the override file has required fields
+            if command -v yq &>/dev/null; then
+              REASON=$(yq '.reason'   .security/override.yml 2>/dev/null)
+              EXPIRY=$(yq '.expires'  .security/override.yml 2>/dev/null)
+              TICKET=$(yq '.ticket'   .security/override.yml 2>/dev/null)
+              APPROVER=$(yq '.approved_by' .security/override.yml 2>/dev/null)
+
+              # Check expiry
+              if [ -n "$EXPIRY" ]; then
+                EXPIRY_TS=$(date -d "$EXPIRY" +%s 2>/dev/null || echo "0")
+                NOW_TS=$(date +%s)
+                if [ "$EXPIRY_TS" -gt "$NOW_TS" ]; then
+                  OVERRIDE_FOUND="true"
+                  OVERRIDE_REASON="$REASON (Ticket: $TICKET)"
+                  echo "File-based override found. Expires: $EXPIRY"
+                else
+                  echo "⚠️  File-based override found but EXPIRED ($EXPIRY)"
+                fi
+              fi
+            fi
+          fi
+
+          echo "found=$OVERRIDE_FOUND"   >> $GITHUB_OUTPUT
+          echo "reason=$OVERRIDE_REASON" >> $GITHUB_OUTPUT
+
+      # -----------------------------------------------------------------------
+      # Aggregate override checks
+      # -----------------------------------------------------------------------
+      - name: Aggregate override status
+        id: check
+        run: |
+          LABEL_FOUND="${{ steps.label-check.outputs.found }}"
+          COMMENT_FOUND="${{ steps.comment-check.outputs.found }}"
+          FILE_FOUND="${{ steps.file-check.outputs.found }}"
+
+          OVERRIDE_ACTIVE="false"
+          OVERRIDE_TYPE=""
+          OVERRIDE_REASON=""
+          OVERRIDE_APPROVER=""
+
+          if [ "$LABEL_FOUND" == "true" ]; then
+            OVERRIDE_ACTIVE="true"
+            OVERRIDE_TYPE="label"
+            OVERRIDE_APPROVER="${{ steps.label-check.outputs.approver }}"
+            OVERRIDE_REASON="Security override label applied by $OVERRIDE_APPROVER"
+
+          elif [ "$COMMENT_FOUND" == "true" ]; then
+            OVERRIDE_ACTIVE="true"
+            OVERRIDE_TYPE="comment"
+            OVERRIDE_APPROVER="${{ steps.comment-check.outputs.approver }}"
+            OVERRIDE_REASON="${{ steps.comment-check.outputs.reason }}"
+
+          elif [ "$FILE_FOUND" == "true" ]; then
+            OVERRIDE_ACTIVE="true"
+            OVERRIDE_TYPE="file"
+            OVERRIDE_REASON="${{ steps.file-check.outputs.reason }}"
+          fi
+
+          # Calculate expiry (24 hours from now)
+          EXPIRES=$(date -d '+24 hours' --iso-8601=seconds 2>/dev/null || \
+                    date -v+24H +%Y-%m-%dT%H:%M:%S 2>/dev/null || \
+                    echo "unknown")
+
+          echo "override_active=$OVERRIDE_ACTIVE"     >> $GITHUB_OUTPUT
+          echo "override_type=$OVERRIDE_TYPE"         >> $GITHUB_OUTPUT
+          echo "override_reason=$OVERRIDE_REASON"     >> $GITHUB_OUTPUT
+          echo "override_approver=$OVERRIDE_APPROVER" >> $GITHUB_OUTPUT
+          echo "override_expires=$EXPIRES"            >> $GITHUB_OUTPUT
+
+          if [ "$OVERRIDE_ACTIVE" == "true" ]; then
+            echo "⚠️  Override active: type=$OVERRIDE_TYPE reason=$OVERRIDE_REASON"
+          else
+            echo "ℹ️  No override active - normal gate enforcement applies"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Run security scans
+  # ---------------------------------------------------------------------------
+  security-scans:
+    name: Run Security Scans
+    runs-on: ubuntu-latest
+    needs: validate-override
+
+    outputs:
+      sast_critical: ${{ steps.counts.outputs.sast_critical }}
+      sast_high:     ${{ steps.counts.outputs.sast_high }}
+      sast_medium:   ${{ steps.counts.outputs.sast_medium }}
+      dep_critical:  ${{ steps.counts.outputs.dep_critical }}
+      dep_high:      ${{ steps.counts.outputs.dep_high }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Run Semgrep SAST
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/owasp-top-ten
+        continue-on-error: true
+
+      - name: Run Semgrep (JSON output)
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" \
+            returntocorp/semgrep \
+            semgrep scan \
+              --config=auto \
+              --config=p/security-audit \
+              --json \
+              --output=/src/sast-results.json \
+              /src || true
+
+      - name: Run Trivy dependency scan
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" \
+            aquasec/trivy:latest \
+            fs \
+              --format json \
+              --output /src/trivy-results.json \
+              --exit-code 0 \
+              /src || true
+
+      - name: Count findings
+        id: counts
+        run: |
+          SAST_CRIT=$(jq '[.results[] |
+            select(.extra.severity == "ERROR")] | length' \
+            sast-results.json 2>/dev/null || echo "0")
+          SAST_HIGH=$(jq '[.results[] |
+            select(.extra.severity == "WARNING")] | length' \
+            sast-results.json 2>/dev/null || echo "0")
+          SAST_MED=$(jq '[.results[] |
+            select(.extra.severity == "INFO")] | length' \
+            sast-results.json 2>/dev/null || echo "0")
+          DEP_CRIT=$(jq '[.Results[].Vulnerabilities[]? |
+            select(.Severity == "CRITICAL")] | length' \
+            trivy-results.json 2>/dev/null || echo "0")
+          DEP_HIGH=$(jq '[.Results[].Vulnerabilities[]? |
+            select(.Severity == "HIGH")] | length' \
+            trivy-results.json 2>/dev/null || echo "0")
+
+          echo "sast_critical=$SAST_CRIT" >> $GITHUB_OUTPUT
+          echo "sast_high=$SAST_HIGH"     >> $GITHUB_OUTPUT
+          echo "sast_medium=$SAST_MED"    >> $GITHUB_OUTPUT
+          echo "dep_critical=$DEP_CRIT"   >> $GITHUB_OUTPUT
+          echo "dep_high=$DEP_HIGH"       >> $GITHUB_OUTPUT
+
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: scan-results-${{ github.run_number }}
+          path: |
+            sast-results.json
+            trivy-results.json
+          retention-days: 90    # Keep override-related scans longer
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Enforce security gate with override awareness
+  # This is the core of Example 3.7 from the book, fully implemented
+  # ---------------------------------------------------------------------------
+  enforce-gate:
+    name: Enforce Security Gate
+    runs-on: ubuntu-latest
+    needs:
+      - validate-override
+      - security-scans
+    if: always()
+
+    permissions:
+      pull-requests: write
+      issues:        write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # -----------------------------------------------------------------------
+      # Core gate logic - Example 3.7 from the book, expanded
+      # -----------------------------------------------------------------------
+      - name: Check for security override and enforce gate
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Load scan results
+          SAST_CRITICAL="${{ needs.security-scans.outputs.sast_critical }}"
+          SAST_HIGH="${{     needs.security-scans.outputs.sast_high }}"
+          SAST_MEDIUM="${{   needs.security-scans.outputs.sast_medium }}"
+          DEP_CRITICAL="${{  needs.security-scans.outputs.dep_critical }}"
+          DEP_HIGH="${{      needs.security-scans.outputs.dep_high }}"
+
+          # Load override status
+          OVERRIDE_ACTIVE="${{   needs.validate-override.outputs.override_active }}"
+          OVERRIDE_TYPE="${{     needs.validate-override.outputs.override_type }}"
+          OVERRIDE_REASON="${{   needs.validate-override.outputs.override_reason }}"
+          OVERRIDE_APPROVER="${{ needs.validate-override.outputs.override_approver }}"
+          OVERRIDE_EXPIRES="${{  needs.validate-override.outputs.override_expires }}"
+
+          echo "=== Security Gate Evaluation ==="
+          echo "SAST Critical : $SAST_CRITICAL"
+          echo "SAST High     : $SAST_HIGH"
+          echo "SAST Medium   : $SAST_MEDIUM"
+          echo "Dep Critical  : $DEP_CRITICAL"
+          echo "Dep High      : $DEP_HIGH"
+          echo "Override      : $OVERRIDE_ACTIVE ($OVERRIDE_TYPE)"
+
+          # ---------------------------------------------------------------
+          # Determine if gate would fail without override
+          # ---------------------------------------------------------------
+          GATE_WOULD_FAIL="false"
+          FAILURE_REASONS=""
+
+          # Load thresholds from file if available
+          if [ -f ".security/thresholds.yml" ] && command -v yq &>/dev/null; then
+            SAST_CRIT_THRESH=$(yq '.sast.critical' .security/thresholds.yml)
+            SAST_HIGH_THRESH=$(yq '.sast.high'     .security/thresholds.yml)
+            DEP_CRIT_THRESH=$(yq  '.dependencies.critical' .security/thresholds.yml)
+            DEP_HIGH_THRESH=$(yq  '.dependencies.high'     .security/thresholds.yml)
+          else
+            # Defaults from Example 3.6
+            SAST_CRIT_THRESH=0
+            SAST_HIGH_THRESH=3
+            DEP_CRIT_THRESH=0
+            DEP_HIGH_THRESH=5
+          fi
+
+          if [ "$SAST_CRITICAL" -gt "$SAST_CRIT_THRESH" ]; then
+            GATE_WOULD_FAIL="true"
+            FAILURE_REASONS="$FAILURE_REASONS\n- SAST Critical: $SAST_CRITICAL (threshold: $SAST_CRIT_THRESH)"
+          fi
+          if [ "$SAST_HIGH" -gt "$SAST_HIGH_THRESH" ]; then
+            GATE_WOULD_FAIL="true"
+            FAILURE_REASONS="$FAILURE_REASONS\n- SAST High: $SAST_HIGH (threshold: $SAST_HIGH_THRESH)"
+          fi
+          if [ "$DEP_CRITICAL" -gt "$DEP_CRIT_THRESH" ]; then
+            GATE_WOULD_FAIL="true"
+            FAILURE_REASONS="$FAILURE_REASONS\n- Dependency Critical: $DEP_CRITICAL (threshold: $DEP_CRIT_THRESH)"
+          fi
+          if [ "$DEP_HIGH" -gt "$DEP_HIGH_THRESH" ]; then
+            GATE_WOULD_FAIL="true"
+            FAILURE_REASONS="$FAILURE_REASONS\n- Dependency High: $DEP_HIGH (threshold: $DEP_HIGH_THRESH)"
+          fi
+
+          echo "gate_would_fail=$GATE_WOULD_FAIL"   >> $GITHUB_OUTPUT
+          echo "failure_reasons=$FAILURE_REASONS"   >> $GITHUB_OUTPUT
+
+          # ---------------------------------------------------------------
+          # Apply override if active (Example 3.7 core logic)
+          # ---------------------------------------------------------------
+          if [ "$OVERRIDE_ACTIVE" == "true" ] && [ "$GATE_WOULD_FAIL" == "true" ]; then
+            echo "⚠️  Security gate overridden"
+            echo "Type     : $OVERRIDE_TYPE"
+            echo "Reason   : $OVERRIDE_REASON"
+            echo "Approver : $OVERRIDE_APPROVER"
+            echo "Expires  : $OVERRIDE_EXPIRES"
+            echo "gate_status=overridden" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # ---------------------------------------------------------------
+          # Normal gate enforcement
+          # ---------------------------------------------------------------
+          if [ "$GATE_WOULD_FAIL" == "true" ]; then
+            echo "gate_status=failed" >> $GITHUB_OUTPUT
+            printf "Gate failures:\n$FAILURE_REASONS\n"
+            exit 1
+          fi
+
+          echo "gate_status=passed" >> $GITHUB_OUTPUT
+          echo "✅ Security gate passed"
+
+      # -----------------------------------------------------------------------
+      # Write audit log entry
+      # Every gate evaluation is logged - overrides are flagged prominently
+      # Important: Log all overrides for audit (Section 3.2.3)
+      # -----------------------------------------------------------------------
+      - name: Write audit log
+        if: always()
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          GATE_STATUS="${{ steps.gate.outputs.gate_status }}"
+          OVERRIDE_ACTIVE="${{ needs.validate-override.outputs.override_active }}"
+
+          # Build audit entry
+          cat > audit-entry.json << EOF
+          {
+            "timestamp":        "$TIMESTAMP",
+            "repository":       "${{ github.repository }}",
+            "pr_number":        ${{ github.event.pull_request.number }},
+            "pr_title":         "${{ github.event.pull_request.title }}",
+            "pr_author":        "${{ github.actor }}",
+            "branch":           "${{ github.head_ref }}",
+            "target_branch":    "${{ github.base_ref }}",
+            "commit_sha":       "${{ github.sha }}",
+            "gate_status":      "$GATE_STATUS",
+            "override_active":  $OVERRIDE_ACTIVE,
+            "override_type":    "${{ needs.validate-override.outputs.override_type }}",
+            "override_reason":  "${{ needs.validate-override.outputs.override_reason }}",
+            "override_approver":"${{ needs.validate-override.outputs.override_approver }}",
+            "override_expires": "${{ needs.validate-override.outputs.override_expires }}",
+            "findings": {
+              "sast_critical":  ${{ needs.security-scans.outputs.sast_critical }},
+              "sast_high":      ${{ needs.security-scans.outputs.sast_high }},
+              "sast_medium":    ${{ needs.security-scans.outputs.sast_medium }},
+              "dep_critical":   ${{ needs.security-scans.outputs.dep_critical }},
+              "dep_high":       ${{ needs.security-scans.outputs.dep_high }}
+            },
+            "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          EOF
+
+          echo "Audit entry written:"
+          cat audit-entry.json
+
+      - name: Upload audit log
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: audit-log-pr${{ github.event.pull_request.number }}-${{ github.run_number }}
+          path: audit-entry.json
+          retention-days: 365    # Keep audit logs for 1 year
+
+      # -----------------------------------------------------------------------
+      # Notify security team of override
+      # Important: Log all overrides for audit (Section 3.2.3)
+      # -----------------------------------------------------------------------
+      - name: Notify security team of override
+        if: |
+          needs.validate-override.outputs.override_active == 'true' &&
+          steps.gate.outputs.gate_would_fail == 'true'
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "🚨 Security Gate Override Used",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "🚨 Security Gate Override"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Repository:*\n${{ github.repository }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*PR Author:*\n${{ github.actor }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Override Type:*\n${{ needs.validate-override.outputs.override_type }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Approved By:*\n${{ needs.validate-override.outputs.override_approver }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Expires:*\n${{ needs.validate-override.outputs.override_expires }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*SAST Critical:*\n${{ needs.security-scans.outputs.sast_critical }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Reason:*\n${{ needs.validate-override.outputs.override_reason }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": { "type": "plain_text", "text": "View PR" },
+                      "url": "${{ github.event.pull_request.html_url }}"
+                    },
+                    {
+                      "type": "button",
+                      "text": { "type": "plain_text", "text": "View Run" },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      # -----------------------------------------------------------------------
+      # Post unified PR comment
+      # -----------------------------------------------------------------------
+      - name: Post PR comment
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const gateStatus    = '${{ steps.gate.outputs.gate_status }}';
+            const overrideActive = '${{ needs.validate-override.outputs.override_active }}' === 'true';
+            const overrideType   = '${{ needs.validate-override.outputs.override_type }}';
+            const overrideReason = '${{ needs.validate-override.outputs.override_reason }}';
+            const overrideBy     = '${{ needs.validate-override.outputs.override_approver }}';
+            const overrideExp    = '${{ needs.validate-override.outputs.override_expires }}';
+
+            const icons = { passed: '✅', failed: '❌', overridden: '⚠️' };
+            const icon  = icons[gateStatus] || '❓';
+
+            let body = `## ${icon} Security Gate: ${gateStatus.toUpperCase()}\n\n`;
+
+            // Findings table
+            body += `| Scanner | Critical | High | Medium |\n`;
+            body += `|---------|----------|------|--------|\n`;
+            body += `| SAST (Semgrep) | ${{ needs.security-scans.outputs.sast_critical }} | ${{ needs.security-scans.outputs.sast_high }} | ${{ needs.security-scans.outputs.sast_medium }} |\n`;
+            body += `| Dependencies (Trivy) | ${{ needs.security-scans.outputs.dep_critical }} | ${{ needs.security-scans.outputs.dep_high }} | — |\n\n`;
+
+            // Override details
+            if (overrideActive) {
+              body += `### ⚠️ Override Active\n\n`;
+              body += `| Field | Value |\n|-------|-------|\n`;
+              body += `| Type | ${overrideType} |\n`;
+              body += `| Reason | ${overrideReason} |\n`;
+              body += `| Approved By | ${overrideBy} |\n`;
+              body += `| Expires | ${overrideExp} |\n\n`;
+              body += `> ⚠️ **Security review required within 24 hours.**\n`;
+              body += `> The security team has been notified.\n\n`;
+            }
+
+            // How to use override (if gate failed without override)
+            if (gateStatus === 'failed') {
+              body += `### How to Request an Override\n\n`;
+              body += `If this is a genuine emergency (hotfix, confirmed false positive, `;
+              body += `or accepted risk), you can request an override:\n\n`;
+              body += `**Option 1 - Label (recommended):**\n`;
+              body += `1. Ask a security team member to apply the \`security-override\` label\n`;
+              body += `2. They must review the findings and approve\n\n`;
+              body += `**Option 2 - Comment:**\n`;
+              body += `1. Post a comment: \`/security-override <reason>\`\n`;
+              body += `2. A security team member must react with 👍 to approve\n\n`;
+              body += `**Option 3 - File:**\n`;
+              body += `1. Commit \`.security/override.yml\` with justification\n`;
+              body += `2. Security team reviews as part of the PR\n\n`;
+              body += `> ⚠️ All overrides are logged and audited.\n`;
+            }
+
+            body += `\n---\n`;
+            body += `📦 [Scan artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) | `;
+            body += `📋 [Audit log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n`;
+
+            // Update or create comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Security Gate:')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

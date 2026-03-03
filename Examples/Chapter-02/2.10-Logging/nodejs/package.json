@@ -1,0 +1,16 @@
+{
+  "name": "security-logging-nodejs",
+  "version": "1.0.0",
+  "description": "Structured security logging examples — Winston and Pino",
+  "main": "winston.js",
+  "scripts": {
+    "start:winston": "node winston.js",
+    "start:pino": "node pino.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "pino": "^8.17.0",
+    "pino-pretty": "^10.3.0",
+    "winston": "^3.11.0"
+  }
+}

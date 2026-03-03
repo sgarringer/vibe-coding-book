@@ -1,0 +1,62 @@
+# Docker Logging Configuration
+# Chapter 2.10.5
+#
+# Configures Docker to ship logs to your centralized logging platform.
+# Uses the json-file driver locally and fluentd for log shipping.
+#
+# Usage:
+#   docker-compose up -d
+
+version: '3.8'
+
+services:
+
+  # ─── Your Application ───────────────────────────────────────────────────────
+  app:
+    image: your-app:latest
+    environment:
+      - NODE_ENV=production
+      - SERVICE_NAME=my-app
+      - LOG_LEVEL=info
+    ports:
+      - "3000:3000"
+
+    # Ship logs to Fluent Bit for forwarding to your log platform
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: "localhost:24224"
+        fluentd-async: "true"          # don't block app if fluentd is slow
+        fluentd-retry-wait: "1s"
+        fluentd-max-retries: "10"
+        tag: "app.{{.Name}}"
+        # Structured labels added to every log entry
+        labels: "service,environment"
+    labels:
+      - "service=my-app"
+      - "environment=production"
+
+    depends_on:
+      - fluent-bit
+
+  # ─── Fluent Bit Log Shipper ──────────────────────────────────────────────────
+  # Receives logs from Docker and forwards to your log platform.
+  # See fluentd/fluent-bit.conf for routing configuration.
+  fluent-bit:
+    image: fluent/fluent-bit:2.2
+    ports:
+      - "24224:24224"     # Docker log driver input
+      - "24224:24224/udp"
+    volumes:
+      - ../fluentd/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - fluent-bit-buffer:/var/log/fluent-bit
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - DD_API_KEY=${DD_API_KEY:-}
+      - APP_NAME=${APP_NAME:-my-app}
+      - ENV=${ENV:-production}
+    restart: unless-stopped
+
+volumes:
+  fluent-bit-buffer:
+    driver: local

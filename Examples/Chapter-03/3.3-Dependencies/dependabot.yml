@@ -1,0 +1,340 @@
+# =============================================================================
+# Dependabot Configuration
+# Book Reference: Chapter 3, Section 3.3.3.1 - Example 3.11
+# =============================================================================
+#
+# PURPOSE:
+#   Configures GitHub Dependabot to automatically scan dependencies for
+#   vulnerabilities and open PRs to update vulnerable packages.
+#
+# SETUP:
+#   1. Copy this file to .github/dependabot.yml in your repository
+#   2. Go to Settings > Security > Dependabot
+#   3. Enable "Dependabot alerts"
+#   4. Enable "Dependabot security updates"
+#   5. Optionally enable "Dependabot version updates"
+#
+# HOW DEPENDABOT WORKS:
+#   - Security updates : Triggered immediately when a CVE is published
+#                        that affects your dependencies
+#   - Version updates  : Run on the schedule defined below, keeping
+#                        dependencies up to date proactively
+#
+# CUSTOMISE THIS FILE:
+#   - Add or remove package ecosystems to match your stack
+#   - Adjust schedules to match your team's workflow
+#   - Update reviewers and assignees to your team's GitHub usernames
+#   - Adjust open-pull-requests-limit based on your team's capacity
+#
+# SUPPORTED ECOSYSTEMS:
+#   npm, pip, maven, gradle, nuget, composer, cargo, go, hex,
+#   bundler, docker, github-actions, terraform, pub, swift
+# =============================================================================
+
+version: 2
+
+updates:
+
+  # ===========================================================================
+  # Node.js / npm
+  # ===========================================================================
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "UTC"
+
+    # Limit open PRs to avoid overwhelming the team
+    # Security update PRs are created regardless of this limit
+    open-pull-requests-limit: 10
+
+    # Require review from security team for all dependency updates
+    reviewers:
+      - security-team
+
+    assignees:
+      - security-team
+
+    labels:
+      - dependencies
+      - security
+      - javascript
+
+    # Commit message configuration
+    commit-message:
+      prefix: "fix"
+      prefix-development: "chore"
+      include: scope
+
+    # Group related updates into a single PR to reduce noise
+    # This is especially useful for monorepos or projects with many deps
+    groups:
+      # Group all AWS SDK updates together
+      aws-sdk:
+        patterns:
+          - "@aws-sdk/*"
+          - "aws-sdk"
+
+      # Group all testing framework updates
+      testing:
+        patterns:
+          - "jest*"
+          - "@jest/*"
+          - "vitest*"
+          - "mocha*"
+          - "chai*"
+        update-types:
+          - minor
+          - patch
+
+      # Group minor and patch updates for non-critical packages
+      # Major updates are kept separate for manual review
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+    # Ignore specific packages or versions
+    # Use this for packages that require manual upgrade due to breaking changes
+    ignore:
+      # Example: ignore major version bumps for packages with breaking changes
+      # - dependency-name: "react"
+      #   update-types: ["version-update:semver-major"]
+
+      # Example: ignore a specific version that is known to be broken
+      # - dependency-name: "some-package"
+      #   versions: ["1.2.3"]
+      []
+
+    # Allow only direct dependencies to be updated automatically
+    # Set to "all" to also update transitive dependencies
+    allow:
+      - dependency-type: direct
+      - dependency-type: production
+
+  # ===========================================================================
+  # Python / pip
+  # ===========================================================================
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "UTC"
+
+    open-pull-requests-limit: 10
+
+    reviewers:
+      - security-team
+
+    labels:
+      - dependencies
+      - security
+      - python
+
+    commit-message:
+      prefix: "fix"
+      prefix-development: "chore"
+      include: scope
+
+    groups:
+      django:
+        patterns:
+          - "django*"
+          - "Django*"
+
+      aws:
+        patterns:
+          - "boto3*"
+          - "botocore*"
+
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # ===========================================================================
+  # Docker base images
+  # Keeps your container base images up to date with security patches
+  # ===========================================================================
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "09:00"
+      timezone: "UTC"
+
+    open-pull-requests-limit: 5
+
+    reviewers:
+      - security-team
+
+    labels:
+      - dependencies
+      - security
+      - docker
+
+    commit-message:
+      prefix: "fix"
+      include: scope
+
+  # ===========================================================================
+  # GitHub Actions
+  # Keeps your CI/CD workflow actions pinned to secure versions
+  # Prevents supply chain attacks via compromised action versions
+  # ===========================================================================
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: wednesday
+      time: "09:00"
+      timezone: "UTC"
+
+    open-pull-requests-limit: 10
+
+    reviewers:
+      - security-team
+
+    labels:
+      - dependencies
+      - security
+      - github-actions
+
+    commit-message:
+      prefix: "chore"
+      include: scope
+
+    groups:
+      actions-core:
+        patterns:
+          - "actions/*"
+
+  # ===========================================================================
+  # Terraform providers and modules
+  # Only include if you have Terraform in your repository
+  # ===========================================================================
+  - package-ecosystem: terraform
+    directory: /terraform
+    schedule:
+      interval: weekly
+      day: thursday
+      time: "09:00"
+      timezone: "UTC"
+
+    open-pull-requests-limit: 5
+
+    reviewers:
+      - security-team
+      - infrastructure-team
+
+    labels:
+      - dependencies
+      - security
+      - terraform
+
+    commit-message:
+      prefix: "fix"
+      include: scope
+
+  # ===========================================================================
+  # Go modules
+  # Only include if your project uses Go
+  # ===========================================================================
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "UTC"
+
+    open-pull-requests-limit: 10
+
+    reviewers:
+      - security-team
+
+    labels:
+      - dependencies
+      - security
+      - go
+
+    commit-message:
+      prefix: "fix"
+      prefix-development: "chore"
+      include: scope
+
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # ===========================================================================
+  # Ruby / Bundler
+  # Only include if your project uses Ruby
+  # ===========================================================================
+  - package-ecosystem: bundler
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "UTC"
+
+    open-pull-requests-limit: 10
+
+    reviewers:
+      - security-team
+
+    labels:
+      - dependencies
+      - security
+      - ruby
+
+    commit-message:
+      prefix: "fix"
+      prefix-development: "chore"
+      include: scope
+
+  # ===========================================================================
+  # Java / Maven
+  # Only include if your project uses Maven
+  # ===========================================================================
+  - package-ecosystem: maven
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "UTC"
+
+    open-pull-requests-limit: 10
+
+    reviewers:
+      - security-team
+
+    labels:
+      - dependencies
+      - security
+      - java
+
+    commit-message:
+      prefix: "fix"
+      prefix-development: "chore"
+      include: scope
+
+    groups:
+      spring:
+        patterns:
+          - "org.springframework*"
+          - "org.springframework.boot*"
+
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch

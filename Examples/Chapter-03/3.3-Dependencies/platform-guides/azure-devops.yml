@@ -1,0 +1,160 @@
+# =============================================================================
+# Azure DevOps - Dependency Scanning with Mend Bolt
+# Book Reference: Chapter 3, Section 3.3.3.3
+# =============================================================================
+#
+# PURPOSE:
+#   Configures dependency scanning in Azure DevOps pipelines using
+#   Mend Bolt (formerly WhiteSource Bolt) which is free for public
+#   repositories and has a free tier for private repositories.
+#
+# SETUP:
+#   1. Install Mend Bolt extension from Azure DevOps Marketplace:
+#      https://marketplace.visualstudio.com/items?itemName=whitesource.whiteSource-bolt-v2
+#   2. Go to your Azure DevOps project
+#   3. Navigate to Mend Bolt tab and activate (free)
+#   4. Add the WhiteSourceBolt task to your pipeline (shown below)
+#
+# ALTERNATIVE - Microsoft Security DevOps (free, no extension needed):
+#   Uses the microsoft/security-devops-action which includes:
+#   - Trivy for container scanning
+#   - Checkov for IaC scanning
+#   - ESLint security rules
+#   - Bandit for Python
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - staging
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+schedules:
+  - cron: "0 0 * * *"
+    displayName: Daily dependency scan
+    branches:
+      include:
+        - main
+    always: true
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  # Severity threshold - pipeline fails if vulnerabilities at or above
+  # this severity are found
+  # Options: low, medium, high, critical
+  BREAK_ON_SEVERITY: high
+
+stages:
+
+  # ===========================================================================
+  # Stage 1: Dependency scanning with Mend Bolt (free extension)
+  # ===========================================================================
+  - stage: DependencyScanning
+    displayName: Dependency Scanning
+    jobs:
+
+      - job: MendBoltScan
+        displayName: Mend Bolt Dependency Scan
+        steps:
+          - checkout: self
+
+          # -------------------------------------------------------------------
+          # Mend Bolt scan
+          # Requires the Mend Bolt extension to be installed and activated
+          # -------------------------------------------------------------------
+          - task: WhiteSource@21
+            displayName: Mend Bolt - Scan Dependencies
+            inputs:
+              cwd: $(System.DefaultWorkingDirectory)
+            continueOnError: true
+
+      # -----------------------------------------------------------------------
+      # Alternative: Microsoft Security DevOps (no extension required)
+      # Uses the same tools as GitHub Advanced Security
+      # -----------------------------------------------------------------------
+      - job: MicrosoftSecurityDevOps
+        displayName: Microsoft Security DevOps Scan
+        steps:
+          - checkout: self
+
+          - task: UseDotNet@2
+            displayName: Install .NET
+            inputs:
+              version: 6.x
+
+          - task: MicrosoftSecurityDevOps@1
+            displayName: Microsoft Security DevOps
+            inputs:
+              categories: dependencies
+              break: true
+
+          - task: PublishSecurityAnalysisLogs@3
+            displayName: Publish Security Analysis Logs
+            inputs:
+              ArtifactName: CodeAnalysisLogs
+              ArtifactType: Container
+            condition: always()
+
+      # -----------------------------------------------------------------------
+      # Trivy scan (no extension required - uses Docker)
+      # Most flexible option - same tool as the GitHub Actions examples
+      # -----------------------------------------------------------------------
+      - job: TrivyScan
+        displayName: Trivy Dependency Scan
+        steps:
+          - checkout: self
+
+          - script: |
+              docker run --rm \
+                -v "$(System.DefaultWorkingDirectory):/src" \
+                aquasec/trivy:latest \
+                fs \
+                  --format json \
+                  --output /src/trivy-results.json \
+                  --severity CRITICAL,HIGH,MEDIUM \
+                  --exit-code 0 \
+                  --ignore-unfixed \
+                  /src
+            displayName: Run Trivy filesystem scan
+
+          - script: |
+              CRITICAL=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' trivy-results.json 2>/dev/null || echo "0")
+              HIGH=$(jq     '[.Results[].Vulnerabilities[]? | select(.Severity == "HIGH")]     | length' trivy-results.json 2>/dev/null || echo "0")
+              MEDIUM=$(jq   '[.Results[].Vulnerabilities[]? | select(.Severity == "MEDIUM")]   | length' trivy-results.json 2>/dev/null || echo "0")
+
+              echo "Critical: $CRITICAL | High: $HIGH | Medium: $MEDIUM"
+
+              echo "##vso[task.setvariable variable=TRIVY_CRITICAL]$CRITICAL"
+              echo "##vso[task.setvariable variable=TRIVY_HIGH]$HIGH"
+              echo "##vso[task.setvariable variable=TRIVY_MEDIUM]$MEDIUM"
+
+              if [ "$CRITICAL" -gt 0 ]; then
+                echo "##vso[task.logissue type=error]Critical vulnerabilities found: $CRITICAL"
+                echo "##vso[task.complete result=Failed]Critical vulnerabilities found"
+                exit 1
+              fi
+
+              if [ "$HIGH" -gt 5 ]; then
+                echo "##vso[task.logissue type=error]High vulnerabilities exceeded threshold: $HIGH > 5"
+                echo "##vso[task.complete result=Failed]High vulnerability threshold exceeded"
+                exit 1
+              fi
+
+              echo "##vso[task.complete result=Succeeded]Dependency scan passed"
+            displayName: Evaluate security thresholds
+
+          - task: PublishBuildArtifacts@1
+            displayName: Publish Trivy results
+            inputs:
+              PathtoPublish: trivy-results.json
+              ArtifactName: trivy-dependency-results
+            condition: always()

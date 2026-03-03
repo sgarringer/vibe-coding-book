@@ -1,0 +1,253 @@
+# =============================================================================
+# GitLab CI - Dependency Scanning
+# Book Reference: Chapter 3, Section 3.3.3.2 - Example 3.12
+# =============================================================================
+#
+# PURPOSE:
+#   Enables GitLab's built-in dependency scanning and extends it with
+#   additional configuration, threshold enforcement, and notifications.
+#
+# SETUP:
+#   Option A - Minimal (Example 3.12 from the book):
+#     Copy just the 'include' block to your .gitlab-ci.yml
+#
+#   Option B - Full configuration:
+#     Copy this entire file or merge it into your existing .gitlab-ci.yml
+#
+# GITLAB TIERS:
+#   Dependency scanning results in the Security Dashboard require
+#   GitLab Ultimate. The scan itself runs on all tiers.
+#   Results are always available in the pipeline artifacts.
+#
+# SUPPORTED LANGUAGES (GitLab built-in):
+#   JavaScript (npm, yarn), Python (pip), Ruby (bundler),
+#   Java (maven, gradle), Go, PHP (composer), .NET (nuget),
+#   C/C++ (conan), Rust (cargo), Scala (sbt)
+# =============================================================================
+
+# =============================================================================
+# Include GitLab's built-in dependency scanning template
+# This is the minimal configuration from Example 3.12
+# One line is all you need to get started
+# =============================================================================
+include:
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+
+# =============================================================================
+# Global variables
+# Override GitLab's default dependency scanning behaviour
+# =============================================================================
+variables:
+  # Fail the pipeline if vulnerabilities above this severity are found
+  # Options: unknown, low, medium, high, critical
+  DS_DEFAULT_ANALYZERS: "gemnasium,gemnasium-maven,gemnasium-python,retire.js,bundler-audit"
+
+  # Exclude dev dependencies from scanning
+  # Set to "false" to include dev dependencies
+  DS_EXCLUDED_PATHS: "spec, test, tests, tmp"
+
+  # Maximum depth to search for dependency files
+  DS_MAX_DEPTH: "2"
+
+stages:
+  - test
+  - security
+  - notify
+
+# =============================================================================
+# Override the built-in dependency scanning job
+# Adds threshold enforcement on top of the built-in scan
+# =============================================================================
+dependency_scanning:
+  stage: security
+  variables:
+    SECURE_LOG_LEVEL: info
+  artifacts:
+    reports:
+      dependency_scanning: gl-dependency-scanning-report.json
+    paths:
+      - gl-dependency-scanning-report.json
+    when: always
+    expire_in: 30 days
+
+# =============================================================================
+# Threshold enforcement job
+# Reads the GitLab dependency scanning report and enforces thresholds
+# Runs after the built-in dependency_scanning job completes
+# =============================================================================
+dependency-threshold-check:
+  stage: security
+  image: alpine:latest
+  needs:
+    - job: dependency_scanning
+      artifacts: true
+
+  before_script:
+    - apk add --no-cache jq curl
+
+  variables:
+    CRITICAL_THRESHOLD: "0"
+    HIGH_THRESHOLD: "5"
+    MEDIUM_THRESHOLD: "20"
+
+  script:
+    - |
+      echo "============================================"
+      echo "  Dependency Threshold Enforcement"
+      echo "============================================"
+
+      if [ ! -f gl-dependency-scanning-report.json ]; then
+        echo "No dependency scanning report found"
+        exit 0
+      fi
+
+      # Count vulnerabilities by severity from GitLab report format
+      CRITICAL=$(jq '[.vulnerabilities[]? | select(.severity == "Critical")] | length' gl-dependency-scanning-report.json 2>/dev/null || echo "0")
+      HIGH=$(jq     '[.vulnerabilities[]? | select(.severity == "High")]     | length' gl-dependency-scanning-report.json 2>/dev/null || echo "0")
+      MEDIUM=$(jq   '[.vulnerabilities[]? | select(.severity == "Medium")]   | length' gl-dependency-scanning-report.json 2>/dev/null || echo "0")
+      LOW=$(jq      '[.vulnerabilities[]? | select(.severity == "Low")]      | length' gl-dependency-scanning-report.json 2>/dev/null || echo "0")
+
+      echo "Critical : $CRITICAL (threshold: $CRITICAL_THRESHOLD)"
+      echo "High     : $HIGH     (threshold: $HIGH_THRESHOLD)"
+      echo "Medium   : $MEDIUM   (threshold: $MEDIUM_THRESHOLD)"
+      echo "Low      : $LOW      (ignored)"
+
+      # Write counts to dotenv for downstream jobs
+      echo "DEP_CRITICAL=$CRITICAL" >> dep-threshold.env
+      echo "DEP_HIGH=$HIGH"         >> dep-threshold.env
+      echo "DEP_MEDIUM=$MEDIUM"     >> dep-threshold.env
+      echo "DEP_LOW=$LOW"           >> dep-threshold.env
+
+      GATE_STATUS="pass"
+
+      if [ "$CRITICAL" -gt "$CRITICAL_THRESHOLD" ]; then
+        GATE_STATUS="fail"
+        echo "FAIL: Critical threshold exceeded: $CRITICAL > $CRITICAL_THRESHOLD"
+      fi
+
+      if [ "$HIGH" -gt "$HIGH_THRESHOLD" ]; then
+        GATE_STATUS="fail"
+        echo "FAIL: High threshold exceeded: $HIGH > $HIGH_THRESHOLD"
+      fi
+
+      if [ "$MEDIUM" -gt "$MEDIUM_THRESHOLD" ]; then
+        echo "WARN: Medium threshold exceeded: $MEDIUM > $MEDIUM_THRESHOLD"
+        echo "      Address these in the next sprint"
+      fi
+
+      echo "DEP_GATE_STATUS=$GATE_STATUS" >> dep-threshold.env
+      echo "Gate status: $GATE_STATUS"
+
+      # Print critical findings with remediation context
+      if [ "$CRITICAL" -gt 0 ]; then
+        echo ""
+        echo "=== Critical Findings - Fix Before Merging ==="
+        jq -r '
+          .vulnerabilities[]? |
+          select(.severity == "Critical") |
+          "Package  : \(.location.dependency.package.name) \(.location.dependency.version)\nCVE      : \(.identifiers[0].value // "N/A")\nFix      : \(.solution // "No fix available")\nDetails  : \(.description // "N/A")\n"
+        ' gl-dependency-scanning-report.json | head -60
+      fi
+
+      [ "$GATE_STATUS" == "fail" ] && exit 1 || exit 0
+
+  artifacts:
+    reports:
+      dotenv: dep-threshold.env
+    paths:
+      - dep-threshold.env
+    when: always
+    expire_in: 30 days
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
+# =============================================================================
+# Post MR note with dependency scan results
+# =============================================================================
+dependency-mr-comment:
+  stage: notify
+  image: alpine:latest
+  needs:
+    - job: dependency-threshold-check
+      artifacts: true
+  before_script:
+    - apk add --no-cache curl jq
+
+  script:
+    - |
+      if [ -z "$CI_MERGE_REQUEST_IID" ] || [ -z "$GITLAB_TOKEN" ]; then
+        echo "Not a merge request or no GITLAB_TOKEN set - skipping comment"
+        exit 0
+      fi
+
+      STATUS_ICON="PASSED"
+      [ "$DEP_GATE_STATUS" == "fail" ] && STATUS_ICON="FAILED"
+
+      NOTE="## Dependency Scan Results\n\n"
+      NOTE="${NOTE}| Severity | Count |\n"
+      NOTE="${NOTE}|----------|-------|\n"
+      NOTE="${NOTE}| Critical | $DEP_CRITICAL |\n"
+      NOTE="${NOTE}| High     | $DEP_HIGH |\n"
+      NOTE="${NOTE}| Medium   | $DEP_MEDIUM |\n"
+      NOTE="${NOTE}| Low      | $DEP_LOW |\n\n"
+      NOTE="${NOTE}**Gate Status: $STATUS_ICON**\n\n"
+      NOTE="${NOTE}[View Pipeline]($CI_PIPELINE_URL)"
+
+      curl -s --request POST \
+        --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "{\"body\": \"$NOTE\"}" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes"
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+  allow_failure: true
+
+# =============================================================================
+# Scheduled daily scan
+# Catches newly disclosed CVEs even without code changes
+# Set up in GitLab: CI/CD > Schedules > New schedule
+# =============================================================================
+dependency-daily-notify:
+  stage: notify
+  image: alpine:latest
+  needs:
+    - job: dependency-threshold-check
+      artifacts: true
+  before_script:
+    - apk add --no-cache curl
+
+  script:
+    - |
+      if [ -z "$SLACK_WEBHOOK_URL" ]; then
+        echo "SLACK_WEBHOOK_URL not set - skipping notification"
+        exit 0
+      fi
+
+      COLOR="good"
+      [ "$DEP_GATE_STATUS" == "fail" ] && COLOR="danger"
+
+      curl -s -X POST "$SLACK_WEBHOOK_URL" \
+        -H 'Content-type: application/json' \
+        --data "{
+          \"attachments\": [{
+            \"color\": \"$COLOR\",
+            \"title\": \"Daily Dependency Scan: $DEP_GATE_STATUS\",
+            \"fields\": [
+              {\"title\": \"Project\",  \"value\": \"$CI_PROJECT_NAME\", \"short\": true},
+              {\"title\": \"Critical\", \"value\": \"$DEP_CRITICAL\",    \"short\": true},
+              {\"title\": \"High\",     \"value\": \"$DEP_HIGH\",        \"short\": true},
+              {\"title\": \"Medium\",   \"value\": \"$DEP_MEDIUM\",      \"short\": true},
+              {\"title\": \"Pipeline\", \"value\": \"$CI_PIPELINE_URL\", \"short\": false}
+            ]
+          }]
+        }"
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: always
+  allow_failure: true

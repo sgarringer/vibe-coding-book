@@ -1,0 +1,144 @@
+# =============================================================================
+# Bitbucket Pipelines - Dependency Scanning with Snyk
+# Book Reference: Chapter 3, Section 3.3.3.3
+# =============================================================================
+#
+# PURPOSE:
+#   Configures dependency scanning in Bitbucket Pipelines using Snyk
+#   (free tier available) and Trivy (fully free).
+#
+# SETUP FOR SNYK:
+#   1. Create a Snyk account at https://snyk.io (free tier available)
+#   2. Get your API token: Snyk Dashboard > Account Settings > API Token
+#   3. Add SNYK_TOKEN to Bitbucket repository variables:
+#      Repository Settings > Pipelines > Repository variables
+#
+# SETUP FOR TRIVY:
+#   No setup required - uses public Docker image
+#
+# FREE TIER LIMITS (Snyk):
+#   - 200 tests/month for open source projects
+#   - Unlimited for public repositories
+# =============================================================================
+
+image: node:18
+
+definitions:
+
+  # ===========================================================================
+  # Reusable steps
+  # ===========================================================================
+  steps:
+
+    - step: &trivy-scan
+        name: Trivy Dependency Scan
+        image: aquasec/trivy:latest
+        script:
+          - trivy fs
+              --format json
+              --output trivy-results.json
+              --severity CRITICAL,HIGH,MEDIUM
+              --exit-code 0
+              --ignore-unfixed
+              .
+
+          - |
+            CRITICAL=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' trivy-results.json 2>/dev/null || echo "0")
+            HIGH=$(jq     '[.Results[].Vulnerabilities[]? | select(.Severity == "HIGH")]     | length' trivy-results.json 2>/dev/null || echo "0")
+            MEDIUM=$(jq   '[.Results[].Vulnerabilities[]? | select(.Severity == "MEDIUM")]   | length' trivy-results.json 2>/dev/null || echo "0")
+
+            echo "Critical: $CRITICAL | High: $HIGH | Medium: $MEDIUM"
+
+            if [ "$CRITICAL" -gt 0 ]; then
+              echo "FAILED: Critical vulnerabilities found: $CRITICAL"
+              exit 1
+            fi
+
+            if [ "$HIGH" -gt 5 ]; then
+              echo "FAILED: High vulnerability threshold exceeded: $HIGH > 5"
+              exit 1
+            fi
+
+            echo "PASSED: Dependency scan thresholds met"
+
+        artifacts:
+          - trivy-results.json
+
+    - step: &snyk-scan
+        name: Snyk Dependency Scan
+        script:
+          - npm install -g snyk
+          - snyk auth $SNYK_TOKEN
+          - snyk test
+              --all-projects
+              --severity-threshold=high
+              --json-file-output=snyk-results.json
+              || true
+
+          - |
+            CRITICAL=$(jq '[.[].vulnerabilities[]? | select(.severity == "critical")] | length' snyk-results.json 2>/dev/null || echo "0")
+            HIGH=$(jq     '[.[].vulnerabilities[]? | select(.severity == "high")]     | length' snyk-results.json 2>/dev/null || echo "0")
+
+            echo "Snyk - Critical: $CRITICAL | High: $HIGH"
+
+            if [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 5 ]; then
+              echo "FAILED: Snyk threshold exceeded"
+              exit 1
+            fi
+
+            echo "PASSED: Snyk scan thresholds met"
+
+        artifacts:
+          - snyk-results.json
+
+    - step: &npm-audit
+        name: npm audit
+        script:
+          - npm ci
+          - npm audit --json > npm-audit-results.json || true
+
+          - |
+            CRITICAL=$(jq '.metadata.vulnerabilities.critical // 0' npm-audit-results.json 2>/dev/null || echo "0")
+            HIGH=$(jq     '.metadata.vulnerabilities.high     // 0' npm-audit-results.json 2>/dev/null || echo "0")
+
+            echo "npm audit - Critical: $CRITICAL | High: $HIGH"
+
+            if [ "$CRITICAL" -gt 0 ]; then
+              echo "FAILED: Critical npm vulnerabilities found"
+              exit 1
+            fi
+
+            echo "PASSED: npm audit thresholds met"
+
+        artifacts:
+          - npm-audit-results.json
+
+# ===========================================================================
+# Pipeline definitions
+# ===========================================================================
+pipelines:
+
+  # Pull request pipeline - runs on every PR
+  pull-requests:
+    '**':
+      - step: *trivy-scan
+      - step: *npm-audit
+
+  # Branch pipelines
+  branches:
+
+    main:
+      - step: *trivy-scan
+      - step: *snyk-scan
+      - step: *npm-audit
+
+    develop:
+      - step: *trivy-scan
+      - step: *npm-audit
+
+  # Scheduled daily scan
+  custom:
+    daily-dependency-scan:
+      - step: *trivy-scan
+      - step: *snyk-scan
+      - step: *npm-audit

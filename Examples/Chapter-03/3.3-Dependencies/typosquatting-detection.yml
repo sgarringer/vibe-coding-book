@@ -1,0 +1,727 @@
+# =============================================================================
+# Typosquatting and Supply Chain Attack Detection
+# Book Reference: Chapter 3, Section 3.3.4 and 3.3.5
+# =============================================================================
+#
+# PURPOSE:
+#   Detects typosquatting, dependency confusion, and suspicious packages
+#   before they can compromise your build pipeline or developer machines.
+#
+#   Addresses the AI-assisted typosquatting risk from Section 3.3.4.2:
+#   AI coding tools can suggest typo'd package names that developers
+#   copy-paste without verification.
+#
+# WHAT THIS WORKFLOW DOES:
+#   1. Socket.dev scan    - Real-time package analysis and typosquatting detection
+#   2. Package reputation - Checks download counts, age, and author reputation
+#   3. Manifest audit     - Scans package.json/requirements.txt for suspicious packages
+#   4. pip-audit          - Python package vulnerability and reputation check
+#   5. Custom heuristics  - Flags packages matching Table 3.6 red flags
+#
+# SETUP REQUIRED:
+#   1. SOCKET_SECURITY_API_KEY (optional but recommended):
+#      Create account at https://socket.dev
+#      Settings > API Keys > Create key
+#      Add as repository secret: SOCKET_SECURITY_API_KEY
+#
+#   2. NPM_TOKEN (optional):
+#      Required only if scanning private npm packages
+#
+# TRIGGERS:
+#   - Every PR that modifies package manifests
+#   - Push to main/develop that modifies package manifests
+#   - Manual trigger for ad-hoc scanning
+#
+# IMPORTANT:
+#   This workflow is intentionally separate from your main security gate
+#   so it can be tuned independently. Typosquatting checks have a higher
+#   false positive rate than CVE scanning.
+# =============================================================================
+
+name: Typosquatting Detection
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+      - 'yarn.lock'
+      - 'requirements.txt'
+      - 'requirements*.txt'
+      - 'Pipfile'
+      - 'Pipfile.lock'
+      - 'pyproject.toml'
+      - 'poetry.lock'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Gemfile'
+      - 'Gemfile.lock'
+      - 'pom.xml'
+      - 'build.gradle'
+      - '**/package.json'
+      - '**/requirements.txt'
+
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+      - 'requirements.txt'
+      - 'requirements*.txt'
+
+  # Allow manual trigger for ad-hoc scanning of any branch
+  workflow_dispatch:
+    inputs:
+      scan_all:
+        description: 'Scan all packages including unchanged ones'
+        required: false
+        default: 'false'
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Job 1: Detect changed package manifests
+  # Only scan files that were actually changed in this PR
+  # Reduces noise and speeds up the workflow
+  # ---------------------------------------------------------------------------
+  detect-changes:
+    name: Detect Changed Manifests
+    runs-on: ubuntu-latest
+
+    outputs:
+      has_npm:    ${{ steps.changes.outputs.npm }}
+      has_python: ${{ steps.changes.outputs.python }}
+      has_go:     ${{ steps.changes.outputs.go }}
+      has_ruby:   ${{ steps.changes.outputs.ruby }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0    # Need full history to detect changes
+
+      - name: Detect changed manifest files
+        id: changes
+        run: |
+          # For workflow_dispatch with scan_all=true, scan everything
+          if [ "${{ github.event.inputs.scan_all }}" == "true" ]; then
+            echo "npm=true"    >> $GITHUB_OUTPUT
+            echo "python=true" >> $GITHUB_OUTPUT
+            echo "go=true"     >> $GITHUB_OUTPUT
+            echo "ruby=true"   >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # For PRs, check what changed
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.event.after }}"
+          fi
+
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD" 2>/dev/null || \
+                    git diff --name-only HEAD~1 HEAD)
+
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          # Check each ecosystem
+          NPM_CHANGED=false
+          PYTHON_CHANGED=false
+          GO_CHANGED=false
+          RUBY_CHANGED=false
+
+          echo "$CHANGED" | grep -qE "(package\.json|package-lock\.json|yarn\.lock)" && NPM_CHANGED=true
+          echo "$CHANGED" | grep -qE "(requirements.*\.txt|Pipfile|pyproject\.toml|poetry\.lock)" && PYTHON_CHANGED=true
+          echo "$CHANGED" | grep -qE "(go\.mod|go\.sum)" && GO_CHANGED=true
+          echo "$CHANGED" | grep -qE "(Gemfile|Gemfile\.lock)" && RUBY_CHANGED=true
+
+          echo "npm=$NPM_CHANGED"       >> $GITHUB_OUTPUT
+          echo "python=$PYTHON_CHANGED" >> $GITHUB_OUTPUT
+          echo "go=$GO_CHANGED"         >> $GITHUB_OUTPUT
+          echo "ruby=$RUBY_CHANGED"     >> $GITHUB_OUTPUT
+
+          echo "Ecosystems changed: npm=$NPM_CHANGED python=$PYTHON_CHANGED go=$GO_CHANGED ruby=$RUBY_CHANGED"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Socket.dev scan
+  # Real-time package analysis - best tool for typosquatting detection
+  # Table 3.7: Socket.dev - Real-time package analysis, typosquatting detection
+  # ---------------------------------------------------------------------------
+  socket-scan:
+    name: Socket.dev Package Analysis
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_npm == 'true'
+
+    permissions:
+      pull-requests: write
+      contents: read
+
+    outputs:
+      status: ${{ steps.evaluate.outputs.status }}
+      issues_found: ${{ steps.evaluate.outputs.issues_found }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      # -----------------------------------------------------------------------
+      # Install Socket CLI
+      # Table 3.8: npm install -g @socketsecurity/cli
+      # -----------------------------------------------------------------------
+      - name: Install Socket CLI
+        run: npm install -g @socketsecurity/cli
+
+      # -----------------------------------------------------------------------
+      # Run Socket scan
+      # Table 3.8: socket report
+      # Detects typosquatting, malicious packages, and supply chain risks
+      # -----------------------------------------------------------------------
+      - name: Run Socket.dev scan
+        id: socket
+        env:
+          SOCKET_SECURITY_API_KEY: ${{ secrets.SOCKET_SECURITY_API_KEY }}
+        run: |
+          echo "Running Socket.dev package analysis..."
+          echo "Checking for typosquatting, malicious packages, and supply chain risks"
+          echo ""
+
+          # Run socket scan - outputs JSON for processing
+          # --disable-strict-ssl: needed in some CI environments
+          socket report \
+            --json \
+            --output socket-results.json \
+            2>&1 || true
+
+          # Also run human-readable output for logs
+          echo "=== Socket.dev Human-Readable Report ==="
+          socket report 2>&1 || true
+
+      - name: Evaluate Socket results
+        id: evaluate
+        run: |
+          if [ ! -f socket-results.json ]; then
+            echo "No Socket results file - scan may have failed or no package.json found"
+            echo "status=skip"    >> $GITHUB_OUTPUT
+            echo "issues_found=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Count issues by severity from Socket output
+          CRITICAL=$(jq '[.[] | select(.severity == "critical")] | length' socket-results.json 2>/dev/null || echo "0")
+          HIGH=$(jq     '[.[] | select(.severity == "high")]     | length' socket-results.json 2>/dev/null || echo "0")
+          MEDIUM=$(jq   '[.[] | select(.severity == "medium")]   | length' socket-results.json 2>/dev/null || echo "0")
+
+          # Count typosquatting-specific issues
+          TYPOSQUAT=$(jq '[.[] | select(.type == "typosquatting" or .type == "potential-typosquat")] | length' socket-results.json 2>/dev/null || echo "0")
+
+          TOTAL=$((CRITICAL + HIGH + MEDIUM))
+
+          echo "Socket findings: Critical=$CRITICAL High=$HIGH Medium=$MEDIUM Typosquatting=$TYPOSQUAT"
+
+          echo "critical=$CRITICAL"   >> $GITHUB_OUTPUT
+          echo "high=$HIGH"           >> $GITHUB_OUTPUT
+          echo "medium=$MEDIUM"       >> $GITHUB_OUTPUT
+          echo "typosquat=$TYPOSQUAT" >> $GITHUB_OUTPUT
+          echo "issues_found=$TOTAL"  >> $GITHUB_OUTPUT
+
+          STATUS="pass"
+          [ "$CRITICAL" -gt 0 ] && STATUS="fail"
+          [ "$TYPOSQUAT" -gt 0 ] && STATUS="fail"
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: Upload Socket results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: socket-results-${{ github.run_number }}
+          path: socket-results.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Package reputation heuristics
+  # Implements Table 3.6 red flag checks for npm packages
+  # Checks: download count, age, author, repository, documentation
+  # ---------------------------------------------------------------------------
+  npm-reputation-check:
+    name: npm Package Reputation Check
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_npm == 'true'
+
+    permissions:
+      pull-requests: write
+      contents: read
+
+    outputs:
+      status: ${{ steps.gate.outputs.status }}
+      suspicious_count: ${{ steps.check.outputs.suspicious_count }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm install -g npm-check-updates
+
+      # -----------------------------------------------------------------------
+      # Check each package against Table 3.6 red flags:
+      # - Downloads/week < 1000 for packages claiming to be popular
+      # - Age < 30 days
+      # - Missing repository URL
+      # - Unknown author
+      # -----------------------------------------------------------------------
+      - name: Check package reputation
+        id: check
+        run: |
+          if [ ! -f package.json ]; then
+            echo "No package.json found"
+            echo "suspicious_count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          SUSPICIOUS_COUNT=0
+          SUSPICIOUS_PACKAGES=""
+          WARNINGS=""
+
+          # Extract all dependencies
+          ALL_DEPS=$(jq -r '
+            (.dependencies // {}) +
+            (.devDependencies // {}) |
+            keys[]
+          ' package.json 2>/dev/null)
+
+          if [ -z "$ALL_DEPS" ]; then
+            echo "No dependencies found in package.json"
+            echo "suspicious_count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Checking $(echo "$ALL_DEPS" | wc -l) packages against Table 3.6 red flags..."
+          echo ""
+
+          for PKG in $ALL_DEPS; do
+            # Skip scoped packages (@org/package) - less likely to be typosquatted
+            if echo "$PKG" | grep -q "^@"; then
+              continue
+            fi
+
+            # Get package info from npm registry
+            # Example 3.14: npm info reqeusts
+            PKG_INFO=$(npm info "$PKG" --json 2>/dev/null || echo "{}")
+
+            if [ "$PKG_INFO" == "{}" ] || [ -z "$PKG_INFO" ]; then
+              echo "WARNING: Could not fetch info for $PKG"
+              WARNINGS="$WARNINGS\n- $PKG: Could not fetch package info from registry"
+              continue
+            fi
+
+            # Extract metadata
+            WEEKLY_DOWNLOADS=$(curl -s "https://api.npmjs.org/downloads/point/last-week/$PKG" | \
+              jq '.downloads // 0' 2>/dev/null || echo "0")
+            PUBLISH_DATE=$(echo "$PKG_INFO" | jq -r '.time.created // ""' 2>/dev/null)
+            REPO_URL=$(echo "$PKG_INFO" | jq -r '.repository.url // ""' 2>/dev/null)
+            DESCRIPTION=$(echo "$PKG_INFO" | jq -r '.description // ""' 2>/dev/null)
+            VERSION=$(echo "$PKG_INFO" | jq -r '.version // "0.0.0"' 2>/dev/null)
+
+            # Calculate package age in days
+            PKG_AGE_DAYS=9999
+            if [ -n "$PUBLISH_DATE" ]; then
+              PUBLISH_TS=$(date -d "$PUBLISH_DATE" +%s 2>/dev/null || echo "0")
+              NOW_TS=$(date +%s)
+              PKG_AGE_DAYS=$(( (NOW_TS - PUBLISH_TS) / 86400 ))
+            fi
+
+            IS_SUSPICIOUS=false
+            PKG_FLAGS=""
+
+            # Table 3.6 Red Flag: Very few downloads
+            if [ "$WEEKLY_DOWNLOADS" -lt 1000 ] 2>/dev/null; then
+              PKG_FLAGS="$PKG_FLAGS low-downloads($WEEKLY_DOWNLOADS/week)"
+              IS_SUSPICIOUS=true
+            fi
+
+            # Table 3.6 Red Flag: Very new package (< 30 days old)
+            if [ "$PKG_AGE_DAYS" -lt 30 ] 2>/dev/null; then
+              PKG_FLAGS="$PKG_FLAGS new-package(${PKG_AGE_DAYS}d old)"
+              IS_SUSPICIOUS=true
+            fi
+
+            # Table 3.6 Red Flag: Missing repository URL
+            if [ -z "$REPO_URL" ] || [ "$REPO_URL" == "null" ]; then
+              PKG_FLAGS="$PKG_FLAGS no-repository"
+              IS_SUSPICIOUS=true
+            fi
+
+            # Table 3.6 Red Flag: Missing description
+            if [ -z "$DESCRIPTION" ] || [ "$DESCRIPTION" == "null" ]; then
+              PKG_FLAGS="$PKG_FLAGS no-description"
+              IS_SUSPICIOUS=true
+            fi
+
+            # Table 3.6 Red Flag: Very early version (0.0.x)
+            if echo "$VERSION" | grep -qE "^0\.0\.[0-9]+$"; then
+              PKG_FLAGS="$PKG_FLAGS very-early-version($VERSION)"
+              IS_SUSPICIOUS=true
+            fi
+
+            if [ "$IS_SUSPICIOUS" == "true" ]; then
+              SUSPICIOUS_COUNT=$((SUSPICIOUS_COUNT + 1))
+              SUSPICIOUS_PACKAGES="$SUSPICIOUS_PACKAGES\n- $PKG: $PKG_FLAGS"
+              echo "SUSPICIOUS: $PKG [$PKG_FLAGS]"
+            else
+              echo "OK: $PKG (${WEEKLY_DOWNLOADS}/week, ${PKG_AGE_DAYS}d old)"
+            fi
+
+          done
+
+          echo ""
+          echo "Reputation check complete: $SUSPICIOUS_COUNT suspicious package(s) found"
+
+          if [ -n "$SUSPICIOUS_PACKAGES" ]; then
+            echo ""
+            echo "=== Suspicious Packages ==="
+            printf "$SUSPICIOUS_PACKAGES\n"
+          fi
+
+          echo "suspicious_count=$SUSPICIOUS_COUNT" >> $GITHUB_OUTPUT
+
+          # Save results for PR comment
+          cat > reputation-results.json << EOF
+          {
+            "suspicious_count": $SUSPICIOUS_COUNT,
+            "suspicious_packages": "$(printf "$SUSPICIOUS_PACKAGES" | tr '\n' '|')"
+          }
+          EOF
+
+      - name: Evaluate reputation gate
+        id: gate
+        env:
+          SUSPICIOUS_COUNT: ${{ steps.check.outputs.suspicious_count }}
+        run: |
+          STATUS="pass"
+
+          if [ "${SUSPICIOUS_COUNT:-0}" -gt 0 ]; then
+            STATUS="warn"
+            echo "::warning::$SUSPICIOUS_COUNT suspicious package(s) found - review before merging"
+          fi
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: Upload reputation results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: reputation-results-${{ github.run_number }}
+          path: reputation-results.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Python package reputation check
+  # Uses pip-audit for vulnerability scanning and custom heuristics
+  # for typosquatting detection in requirements.txt
+  # ---------------------------------------------------------------------------
+  python-reputation-check:
+    name: Python Package Reputation Check
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_python == 'true'
+
+    permissions:
+      pull-requests: write
+      contents: read
+
+    outputs:
+      status: ${{ steps.gate.outputs.status }}
+      suspicious_count: ${{ steps.check.outputs.suspicious_count }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      # -----------------------------------------------------------------------
+      # pip-audit: Python package vulnerability scanner
+      # Table 3.7: pip-audit - Python package vulnerability scanner
+      # -----------------------------------------------------------------------
+      - name: Run pip-audit
+        id: pip-audit
+        run: |
+          echo "Running pip-audit..."
+
+          # Find all requirements files
+          REQ_FILES=$(find . -name "requirements*.txt" -not -path "./.git/*" | head -10)
+
+          if [ -z "$REQ_FILES" ]; then
+            echo "No requirements files found"
+            exit 0
+          fi
+
+          for REQ_FILE in $REQ_FILES; do
+            echo "Auditing: $REQ_FILE"
+            pip-audit \
+              --requirement "$REQ_FILE" \
+              --format json \
+              --output "pip-audit-$(basename $REQ_FILE).json" \
+              --skip-editable \
+              2>/dev/null || true
+          done
+
+      # -----------------------------------------------------------------------
+      # Check Python packages against typosquatting patterns
+      # Compares package names against known popular packages
+      # -----------------------------------------------------------------------
+      - name: Check Python package reputation
+        id: check
+        run: |
+          SUSPICIOUS_COUNT=0
+
+          # Known popular Python packages - check for typos of these
+          # This list covers the most commonly typosquatted packages
+          POPULAR_PACKAGES="requests urllib3 boto3 numpy pandas flask django \
+            sqlalchemy celery redis pymongo psycopg2 pillow cryptography \
+            paramiko pyyaml click pytest setuptools pip wheel"
+
+          # Find all requirements files
+          REQ_FILES=$(find . -name "requirements*.txt" -not -path "./.git/*" | head -10)
+
+          if [ -z "$REQ_FILES" ]; then
+            echo "No requirements files found"
+            echo "suspicious_count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Checking Python packages for typosquatting patterns..."
+          echo ""
+
+          for REQ_FILE in $REQ_FILES; do
+            echo "Checking: $REQ_FILE"
+
+            # Extract package names (strip version specifiers)
+            PACKAGES=$(grep -v "^#" "$REQ_FILE" | \
+              grep -v "^-" | \
+              grep -v "^$" | \
+              sed 's/[>=<!].*//' | \
+              sed 's/\[.*//' | \
+              tr '[:upper:]' '[:lower:]' | \
+              xargs)
+
+            for PKG in $PACKAGES; do
+              # Check against popular package list using edit distance heuristic
+              # A package that is 1-2 characters different from a popular package
+              # is a potential typosquat
+              for POPULAR in $POPULAR_PACKAGES; do
+                if [ "$PKG" != "$POPULAR" ]; then
+                  # Simple check: same length +-1 and starts with same 3 chars
+                  PKG_LEN=${#PKG}
+                  POP_LEN=${#POPULAR}
+                  LEN_DIFF=$(( PKG_LEN - POP_LEN ))
+                  LEN_DIFF=${LEN_DIFF#-}    # Absolute value
+
+                  PKG_PREFIX="${PKG:0:3}"
+                  POP_PREFIX="${POPULAR:0:3}"
+
+                  if [ "$LEN_DIFF" -le 2 ] && [ "$PKG_PREFIX" == "$POP_PREFIX" ]; then
+                    echo "POTENTIAL TYPOSQUAT: '$PKG' is similar to popular package '$POPULAR'"
+                    SUSPICIOUS_COUNT=$((SUSPICIOUS_COUNT + 1))
+                  fi
+                fi
+              done
+
+              # Check PyPI for package metadata
+              PKG_INFO=$(curl -s "https://pypi.org/pypi/$PKG/json" 2>/dev/null || echo "{}")
+
+              if echo "$PKG_INFO" | jq -e '.info' &>/dev/null; then
+                MONTHLY_DOWNLOADS=$(echo "$PKG_INFO" | \
+                  jq '.info.downloads.last_month // -1' 2>/dev/null || echo "-1")
+                AUTHOR=$(echo "$PKG_INFO" | \
+                  jq -r '.info.author // ""' 2>/dev/null)
+                HOME_PAGE=$(echo "$PKG_INFO" | \
+                  jq -r '.info.home_page // ""' 2>/dev/null)
+
+                # Table 3.6 Red Flag: No homepage/repository
+                if [ -z "$HOME_PAGE" ] || [ "$HOME_PAGE" == "null" ] || [ "$HOME_PAGE" == "UNKNOWN" ]; then
+                  echo "WARNING: $PKG has no homepage/repository URL"
+                fi
+              else
+                echo "WARNING: Could not fetch PyPI info for $PKG"
+              fi
+            done
+          done
+
+          echo ""
+          echo "Python reputation check complete: $SUSPICIOUS_COUNT suspicious package(s)"
+          echo "suspicious_count=$SUSPICIOUS_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Evaluate Python gate
+        id: gate
+        env:
+          SUSPICIOUS_COUNT: ${{ steps.check.outputs.suspicious_count }}
+        run: |
+          STATUS="pass"
+          [ "${SUSPICIOUS_COUNT:-0}" -gt 0 ] && STATUS="warn"
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Unified PR comment and gate enforcement
+  # Aggregates all scan results into a single PR comment
+  # ---------------------------------------------------------------------------
+  typosquatting-summary:
+    name: Typosquatting Detection Summary
+    runs-on: ubuntu-latest
+    needs:
+      - detect-changes
+      - socket-scan
+      - npm-reputation-check
+      - python-reputation-check
+    if: always() && github.event_name == 'pull_request'
+
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Post PR comment
+        uses: actions/github-script@v6
+        env:
+          SOCKET_STATUS: ${{ needs.socket-scan.outputs.status }}
+          SOCKET_ISSUES: ${{ needs.socket-scan.outputs.issues_found }}
+          NPM_STATUS: ${{ needs.npm-reputation-check.outputs.status }}
+          NPM_SUSPICIOUS: ${{ needs.npm-reputation-check.outputs.suspicious_count }}
+          PYTHON_STATUS: ${{ needs.python-reputation-check.outputs.status }}
+          PYTHON_SUSPICIOUS: ${{ needs.python-reputation-check.outputs.suspicious_count }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const socketStatus    = process.env.SOCKET_STATUS    || 'skip';
+            const socketIssues    = process.env.SOCKET_ISSUES    || '0';
+            const npmStatus       = process.env.NPM_STATUS       || 'skip';
+            const npmSuspicious   = process.env.NPM_SUSPICIOUS   || '0';
+            const pythonStatus    = process.env.PYTHON_STATUS    || 'skip';
+            const pythonSuspicious = process.env.PYTHON_SUSPICIOUS || '0';
+            const runUrl          = process.env.RUN_URL;
+
+            const overallFail = socketStatus === 'fail';
+            const overallWarn = socketStatus === 'warn' ||
+                                npmStatus === 'warn' ||
+                                pythonStatus === 'warn';
+
+            const statusLabel = (s) => {
+              if (s === 'fail') return 'BLOCKED';
+              if (s === 'warn') return 'WARNING';
+              if (s === 'pass') return 'PASSED';
+              return 'SKIPPED';
+            };
+
+            const lines = [];
+            lines.push('## Supply Chain and Typosquatting Detection');
+            lines.push('');
+
+            if (overallFail) {
+              lines.push('Merge blocked: Suspicious packages detected.');
+              lines.push('Review the findings below before merging.');
+            } else if (overallWarn) {
+              lines.push('Warnings detected: Review suspicious packages before merging.');
+            } else {
+              lines.push('No typosquatting or supply chain issues detected.');
+            }
+
+            lines.push('');
+            lines.push('| Scanner | Status | Issues |');
+            lines.push('|---------|--------|--------|');
+            lines.push('| Socket.dev (typosquatting) | ' + statusLabel(socketStatus) + ' | ' + socketIssues + ' |');
+            lines.push('| npm reputation (Table 3.6) | ' + statusLabel(npmStatus) + ' | ' + npmSuspicious + ' suspicious |');
+            lines.push('| Python reputation          | ' + statusLabel(pythonStatus) + ' | ' + pythonSuspicious + ' suspicious |');
+            lines.push('');
+
+            if (overallFail || overallWarn) {
+              lines.push('### How to Verify a Suspicious Package');
+              lines.push('');
+              lines.push('Before installing any flagged package, check:');
+              lines.push('');
+              lines.push('1. Run: npm info <package-name>');
+              lines.push('   - Is the download count reasonable for a popular package?');
+              lines.push('   - Is the author a known maintainer?');
+              lines.push('   - Is there a repository URL?');
+              lines.push('');
+              lines.push('2. Check the npm registry: https://www.npmjs.com/package/<name>');
+              lines.push('   - Does the README look legitimate?');
+              lines.push('   - Is the publish date recent (red flag if < 30 days)?');
+              lines.push('');
+              lines.push('3. Check for the correct spelling:');
+              lines.push('   - requests (not reqeusts)');
+              lines.push('   - lodash (not lodahs)');
+              lines.push('   - express (not expres)');
+              lines.push('');
+              lines.push('See Table 3.6 for the full list of red flags.');
+            }
+
+            lines.push('');
+            lines.push('[View full scan results](' + runUrl + ')');
+
+            const body = lines.join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Supply Chain and Typosquatting Detection')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Enforce typosquatting gate
+        env:
+          SOCKET_STATUS: ${{ needs.socket-scan.outputs.status }}
+        run: |
+          if [ "$SOCKET_STATUS" == "fail" ]; then
+            echo "Typosquatting gate FAILED"
+            echo "Suspicious packages detected by Socket.dev"
+            echo "Review the PR comment for details"
+            exit 1
+          fi
+          echo "Typosquatting gate PASSED"

@@ -1,0 +1,265 @@
+# =============================================================================
+# GitHub Actions - Security-Integrated CI/CD Pipeline
+# Book Reference: Chapter 3, Section 3.1.2.2
+# =============================================================================
+# Features demonstrated:
+#   - SAST with Semgrep
+#   - PR comments with scan results
+#   - Artifact uploads
+#   - Slack notifications
+# =============================================================================
+
+name: Security Scanning
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+# Cancel in-progress runs on the same branch to save resources
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Job 1: SAST with Semgrep
+  # Principle: Shift Left - catch issues at commit time
+  # ---------------------------------------------------------------------------
+  semgrep:
+    name: SAST with Semgrep
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+
+    # Only run on PRs or pushes - skip dependabot to avoid token issues
+    if: |
+      github.actor != 'dependabot[bot]'
+
+    permissions:
+      contents: read
+      pull-requests: write      # Required for PR comments
+      security-events: write    # Required for GitHub Security tab upload
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          # Fetch full history for accurate blame information
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # Run Semgrep with multiple rule sets
+      # --config=auto        : Semgrep's recommended rules for detected languages
+      # --config=p/security-audit : Broad security audit rules
+      # --config=p/owasp-top-ten  : OWASP Top 10 specific rules
+      # --config=.semgrep/        : Your custom rules (see semgrep-rules.yml)
+      # -----------------------------------------------------------------------
+      - name: Run Semgrep
+        run: |
+          semgrep scan \
+            --config=auto \
+            --config=p/security-audit \
+            --config=p/owasp-top-ten \
+            --json \
+            --output=semgrep-results.json \
+            --sarif \
+            --sarif-output=semgrep-results.sarif \
+            --verbose
+        # Don't fail here - we evaluate results in the next step
+        # so we can upload artifacts even on failure
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # Upload SARIF to GitHub Security tab
+      # This populates the "Security > Code scanning alerts" dashboard
+      # -----------------------------------------------------------------------
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: semgrep-results.sarif
+          category: semgrep
+
+      # -----------------------------------------------------------------------
+      # Upload raw JSON results as a build artifact
+      # Useful for downstream processing or audit trails
+      # -----------------------------------------------------------------------
+      - name: Upload scan results as artifact
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: semgrep-results-${{ github.run_number }}
+          path: |
+            semgrep-results.json
+            semgrep-results.sarif
+          retention-days: 30
+
+      # -----------------------------------------------------------------------
+      # Generate a human-readable summary for the GitHub Actions summary page
+      # -----------------------------------------------------------------------
+      - name: Generate scan summary
+        if: always()
+        run: |
+          echo "## Semgrep Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Count findings by severity
+          CRITICAL=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' \
+            semgrep-results.json)
+          WARNING=$(jq '[.results[] | select(.extra.severity == "WARNING")] | length' \
+            semgrep-results.json)
+          INFO=$(jq '[.results[] | select(.extra.severity == "INFO")] | length' \
+            semgrep-results.json)
+          TOTAL=$(jq '.results | length' semgrep-results.json)
+
+          echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔴 Critical/Error | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟡 Warning | $WARNING |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔵 Info | $INFO |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Total** | **$TOTAL** |" >> $GITHUB_STEP_SUMMARY
+
+          # List critical findings with file and line number
+          if [ "$CRITICAL" -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🔴 Critical Findings" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            jq -r '.results[] | select(.extra.severity == "ERROR") |
+              "- **\(.check_id)** in `\(.path)` line \(.start.line): \(.extra.message)"' \
+              semgrep-results.json >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # -----------------------------------------------------------------------
+      # Post results as a PR comment
+      # Only runs on pull_request events, not direct pushes
+      # -----------------------------------------------------------------------
+      - name: Post PR comment with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const results = JSON.parse(fs.readFileSync('semgrep-results.json', 'utf8'));
+
+            const critical = results.results.filter(r => r.extra.severity === 'ERROR');
+            const warnings = results.results.filter(r => r.extra.severity === 'WARNING');
+            const info     = results.results.filter(r => r.extra.severity === 'INFO');
+
+            // Build the comment body
+            let body = `## 🔒 Semgrep Security Scan Results\n\n`;
+            body += `| Severity | Count |\n|----------|-------|\n`;
+            body += `| 🔴 Critical | ${critical.length} |\n`;
+            body += `| 🟡 Warning  | ${warnings.length} |\n`;
+            body += `| 🔵 Info     | ${info.length} |\n\n`;
+
+            if (critical.length > 0) {
+              body += `### 🔴 Critical Issues (Build Blocked)\n\n`;
+              critical.slice(0, 10).forEach(r => {
+                body += `**${r.check_id}**\n`;
+                body += `- File: \`${r.path}\` line ${r.start.line}\n`;
+                body += `- Issue: ${r.extra.message}\n\n`;
+              });
+              if (critical.length > 10) {
+                body += `_...and ${critical.length - 10} more. See full results in artifacts._\n\n`;
+              }
+            }
+
+            if (warnings.length > 0) {
+              body += `### 🟡 Warnings\n\n`;
+              warnings.slice(0, 5).forEach(r => {
+                body += `- **${r.check_id}** in \`${r.path}\` line ${r.start.line}\n`;
+              });
+              if (warnings.length > 5) {
+                body += `_...and ${warnings.length - 5} more._\n\n`;
+              }
+            }
+
+            body += `\n---\n`;
+            body += `📦 Full results available in [workflow artifacts]`;
+            body += `(${context.payload.pull_request.html_url}/checks)\n`;
+
+            // Find and update existing comment, or create a new one
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existingComment = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Semgrep Security Scan Results')
+            );
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body,
+              });
+            }
+
+      # -----------------------------------------------------------------------
+      # Fail the build on critical findings
+      # Principle: Fail Fast - block vulnerable code from progressing
+      # -----------------------------------------------------------------------
+      - name: Check for critical findings
+        run: |
+          CRITICAL_COUNT=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' \
+            semgrep-results.json)
+
+          echo "Critical findings: $CRITICAL_COUNT"
+
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "::error::$CRITICAL_COUNT critical security issue(s) found."
+            echo "Review the scan results artifact or PR comment for details."
+            exit 1
+          fi
+
+          echo "✅ No critical security issues found."
+
+      # -----------------------------------------------------------------------
+      # Send Slack notification on failure
+      # Requires SLACK_WEBHOOK_URL secret to be configured
+      # -----------------------------------------------------------------------
+      - name: Notify Slack on critical findings
+        if: failure() && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "🚨 Security scan failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*🚨 Critical Security Issues Found*\n*Repo:* ${{ github.repository }}\n*Branch:* ${{ github.ref_name }}\n*Commit:* ${{ github.sha }}\n*Author:* ${{ github.actor }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": { "type": "plain_text", "text": "View Run" },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

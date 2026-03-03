@@ -1,0 +1,570 @@
+# =============================================================================
+# Custom Semgrep Rules
+# Book Reference: Chapter 3, Sections 3.1.2.2 and 3.1.2.3
+# =============================================================================
+# Usage:
+#   semgrep scan --config=semgrep-rules.yml .
+#
+# Rules included:
+#   1.  Hardcoded passwords          (Example 3.2 from book, expanded)
+#   2.  Hardcoded API keys
+#   3.  Hardcoded tokens
+#   4.  SQL injection patterns
+#   5.  Missing authentication checks
+#   6.  Insecure random number generation
+#   7.  Insecure deserialization
+#   8.  Path traversal
+#   9.  Command injection
+#   10. Insecure TLS/SSL configuration
+# =============================================================================
+
+rules:
+
+  # ===========================================================================
+  # 1. HARDCODED SECRETS
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Rule 1a: Hardcoded Password (Example 3.2 from book - expanded)
+  # ---------------------------------------------------------------------------
+  - id: hardcoded-password
+    patterns:
+      - pattern-either:
+          # Direct assignment
+          - pattern: password = "..."
+          - pattern: passwd = "..."
+          - pattern: pwd = "..."
+          # Dictionary/object assignment
+          - pattern: |
+              {..., "password": "...", ...}
+          - pattern: |
+              {..., 'password': '...', ...}
+          # Function arguments
+          - pattern: |
+              $FUNC(..., password="...", ...)
+    # Exclude empty strings and obvious placeholders
+    pattern-not-regex: '(password\s*=\s*""|password\s*=\s*"<.*>"|password\s*=\s*"your[-_]password")'
+    message: >
+      Hardcoded password detected in '$FUNC' or assignment.
+      Passwords must not be stored in source code.
+      Use environment variables or a secrets manager (e.g., AWS Secrets Manager,
+      HashiCorp Vault) instead.
+      See: https://owasp.org/www-community/vulnerabilities/Use_of_hard-coded_password
+    severity: ERROR
+    languages: [python, javascript, typescript, java, go, ruby]
+    metadata:
+      category: security
+      cwe: CWE-259
+      owasp: A07:2021 - Identification and Authentication Failures
+      confidence: MEDIUM
+
+  # ---------------------------------------------------------------------------
+  # Rule 1b: Hardcoded API Keys
+  # ---------------------------------------------------------------------------
+  - id: hardcoded-api-key
+    patterns:
+      - pattern-either:
+          - pattern: api_key = "..."
+          - pattern: apikey = "..."
+          - pattern: api_secret = "..."
+          - pattern: |
+              {..., "api_key": "...", ...}
+          - pattern: |
+              $FUNC(..., api_key="...", ...)
+    pattern-not-regex: 'api_key\s*=\s*"("|<.*>|your[-_]api[-_]key|placeholder|example)'
+    message: >
+      Hardcoded API key detected.
+      API keys must not be stored in source code.
+      Use environment variables: os.environ.get('API_KEY') or process.env.API_KEY
+    severity: ERROR
+    languages: [python, javascript, typescript, java, go, ruby]
+    metadata:
+      category: security
+      cwe: CWE-798
+      owasp: A07:2021 - Identification and Authentication Failures
+      confidence: MEDIUM
+
+  # ---------------------------------------------------------------------------
+  # Rule 1c: Hardcoded Tokens (JWT, Bearer, etc.)
+  # ---------------------------------------------------------------------------
+  - id: hardcoded-token
+    patterns:
+      - pattern-either:
+          - pattern: token = "..."
+          - pattern: access_token = "..."
+          - pattern: secret_key = "..."
+          - pattern: SECRET_KEY = "..."
+          - pattern: |
+              {..., "token": "...", ...}
+    # Exclude test files and obvious placeholders
+    pattern-not-regex: '(token\s*=\s*"("|<.*>|test[-_]token|fake[-_]token|dummy))'
+    paths:
+      # Don't flag test fixtures - adjust to your project structure
+      exclude:
+        - '**/test/**'
+        - '**/tests/**'
+        - '**/__tests__/**'
+        - '**/*.test.*'
+        - '**/*.spec.*'
+        - '**/fixtures/**'
+    message: >
+      Hardcoded token or secret key detected.
+      Store secrets in environment variables or a secrets manager.
+      For Django: use SECRET_KEY = os.environ.get('SECRET_KEY')
+      For Node.js: use process.env.SECRET_KEY
+    severity: ERROR
+    languages: [python, javascript, typescript, java, go, ruby]
+    metadata:
+      category: security
+      cwe: CWE-798
+      owasp: A07:2021 - Identification and Authentication Failures
+      confidence: MEDIUM
+
+  # ===========================================================================
+  # 2. SQL INJECTION
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Rule 2a: SQL Injection - Python (string formatting)
+  # ---------------------------------------------------------------------------
+  - id: sql-injection-python-format
+    patterns:
+      - pattern-either:
+          # f-string interpolation in SQL
+          - pattern: |
+              $CURSOR.execute(f"...{$VAR}...")
+          - pattern: |
+              $CURSOR.execute(f'...{$VAR}...')
+          # % formatting
+          - pattern: |
+              $CURSOR.execute("..." % $VAR)
+          # .format()
+          - pattern: |
+              $CURSOR.execute("...".format(...))
+          # String concatenation
+          - pattern: |
+              $CURSOR.execute("..." + $VAR + "...")
+    message: >
+      Potential SQL injection via string interpolation.
+      Use parameterized queries instead:
+        cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+      Never build SQL queries by concatenating user-supplied input.
+      See: https://owasp.org/www-community/attacks/SQL_Injection
+    severity: ERROR
+    languages: [python]
+    metadata:
+      category: security
+      cwe: CWE-89
+      owasp: A03:2021 - Injection
+      confidence: HIGH
+
+  # ---------------------------------------------------------------------------
+  # Rule 2b: SQL Injection - JavaScript/TypeScript
+  # ---------------------------------------------------------------------------
+  - id: sql-injection-javascript
+    patterns:
+      - pattern-either:
+          # Template literal interpolation
+          - pattern: |
+              $DB.query(`...${$VAR}...`)
+          - pattern: |
+              $DB.execute(`...${$VAR}...`)
+          # String concatenation
+          - pattern: |
+              $DB.query("..." + $VAR)
+          - pattern: |
+              $DB.query('...' + $VAR)
+    message: >
+      Potential SQL injection via string interpolation.
+      Use parameterized queries instead:
+        db.query('SELECT * FROM users WHERE id = ?', [userId])
+      Or use an ORM like Sequelize or TypeORM with proper parameterization.
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      category: security
+      cwe: CWE-89
+      owasp: A03:2021 - Injection
+      confidence: HIGH
+
+  # ===========================================================================
+  # 3. MISSING AUTHENTICATION CHECKS
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Rule 3a: Flask routes missing authentication decorator
+  # ---------------------------------------------------------------------------
+  - id: flask-route-missing-auth
+    patterns:
+      - pattern: |
+          @app.route(...)
+          def $FUNC(...):
+              ...
+      - pattern-not: |
+          @login_required
+          @app.route(...)
+          def $FUNC(...):
+              ...
+      - pattern-not: |
+          @app.route(...)
+          @login_required
+          def $FUNC(...):
+              ...
+      - pattern-not: |
+          @jwt_required
+          @app.route(...)
+          def $FUNC(...):
+              ...
+      - pattern-not: |
+          @token_required
+          @app.route(...)
+          def $FUNC(...):
+              ...
+    message: >
+      Flask route '$FUNC' may be missing authentication.
+      Ensure all non-public routes are protected with @login_required,
+      @jwt_required, or a custom authentication decorator.
+      If this route is intentionally public, add a comment:
+        # nosemgrep: flask-route-missing-auth
+    severity: WARNING
+    languages: [python]
+    metadata:
+      category: security
+      cwe: CWE-306
+      owasp: A01:2021 - Broken Access Control
+      confidence: LOW
+
+  # ---------------------------------------------------------------------------
+  # Rule 3b: Express routes missing authentication middleware
+  # ---------------------------------------------------------------------------
+  - id: express-route-missing-auth
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $APP.get($PATH, $HANDLER)
+          - pattern: |
+              $APP.post($PATH, $HANDLER)
+          - pattern: |
+              $APP.put($PATH, $HANDLER)
+          - pattern: |
+              $APP.delete($PATH, $HANDLER)
+      - pattern-not: |
+          $APP.get($PATH, authenticate, ...)
+      - pattern-not: |
+          $APP.post($PATH, authenticate, ...)
+      - pattern-not: |
+          $APP.put($PATH, authenticate, ...)
+      - pattern-not: |
+          $APP.delete($PATH, authenticate, ...)
+      - pattern-not: |
+          $APP.get($PATH, requireAuth, ...)
+      - pattern-not: |
+          $APP.post($PATH, requireAuth, ...)
+    message: >
+      Express route may be missing authentication middleware.
+      Consider adding authentication: app.get('/path', authenticate, handler)
+      If this route is intentionally public (e.g., /login, /health),
+      add a comment: // nosemgrep: express-route-missing-auth
+    severity: WARNING
+    languages: [javascript, typescript]
+    metadata:
+      category: security
+      cwe: CWE-306
+      owasp: A01:2021 - Broken Access Control
+      confidence: LOW
+
+  # ===========================================================================
+  # 4. INSECURE RANDOM NUMBER GENERATION
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Rule 4a: Python - using random module for security purposes
+  # ---------------------------------------------------------------------------
+  - id: insecure-random-python
+    patterns:
+      - pattern-either:
+          # Direct use of random for tokens/passwords/keys
+          - pattern: |
+              random.random()
+          - pattern: |
+              random.randint(...)
+          - pattern: |
+              random.choice(...)
+          - pattern: |
+              random.randrange(...)
+    # Only flag when used in security-sensitive contexts
+    # (variable names suggest security use)
+    pattern-either:
+      - pattern: |
+          $TOKEN = random.$FUNC(...)
+      - pattern: |
+          $PASSWORD = random.$FUNC(...)
+      - pattern: |
+          $SECRET = random.$FUNC(...)
+      - pattern: |
+          $KEY = random.$FUNC(...)
+      - pattern: |
+          $NONCE = random.$FUNC(...)
+    message: >
+      Insecure random number generation for security-sensitive value '$TOKEN'.
+      The 'random' module is not cryptographically secure.
+      Use 'secrets' module instead:
+        import secrets
+        token = secrets.token_hex(32)
+        token = secrets.token_urlsafe(32)
+      See: https://docs.python.org/3/library/secrets.html
+    severity: ERROR
+    languages: [python]
+    metadata:
+      category: security
+      cwe: CWE-338
+      owasp: A02:2021 - Cryptographic Failures
+      confidence: HIGH
+
+  # ---------------------------------------------------------------------------
+  # Rule 4b: JavaScript - using Math.random() for security purposes
+  # ---------------------------------------------------------------------------
+  - id: insecure-random-javascript
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $TOKEN = Math.random()
+          - pattern: |
+              $PASSWORD = Math.random()
+          - pattern: |
+              $SECRET = Math.random()
+          - pattern: |
+              $KEY = Math.random()
+          - pattern: |
+              $NONCE = Math.random()
+    message: >
+      Insecure random number generation for security-sensitive value.
+      Math.random() is not cryptographically secure.
+      Use the Web Crypto API instead:
+        const array = new Uint8Array(32);
+        crypto.getRandomValues(array);
+      Or in Node.js:
+        const { randomBytes } = require('crypto');
+        const token = randomBytes(32).toString('hex');
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      category: security
+      cwe: CWE-338
+      owasp: A02:2021 - Cryptographic Failures
+      confidence: HIGH
+
+  # ===========================================================================
+  # 5. INSECURE DESERIALIZATION
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Rule 5a: Python - unsafe pickle usage
+  # ---------------------------------------------------------------------------
+  - id: insecure-deserialization-pickle
+    patterns:
+      - pattern-either:
+          - pattern: |
+              pickle.loads($DATA)
+          - pattern: |
+              pickle.load($FILE)
+          - pattern: |
+              cPickle.loads($DATA)
+    message: >
+      Unsafe deserialization using pickle.
+      Deserializing untrusted data with pickle can lead to arbitrary code execution.
+      Use safe alternatives like JSON for data exchange:
+        import json
+        data = json.loads(user_input)
+      If pickle is required, only deserialize data from trusted, authenticated sources.
+      See: https://owasp.org/www-community/vulnerabilities/Deserialization_of_untrusted_data
+    severity: ERROR
+    languages: [python]
+    metadata:
+      category: security
+      cwe: CWE-502
+      owasp: A08:2021 - Software and Data Integrity Failures
+      confidence: MEDIUM
+
+  # ---------------------------------------------------------------------------
+  # Rule 5b: JavaScript - unsafe JSON.parse on user input
+  # ---------------------------------------------------------------------------
+  - id: insecure-deserialization-js
+    patterns:
+      - pattern-either:
+          - pattern: |
+              eval($REQ.body)
+          - pattern: |
+              eval($REQ.query.$PARAM)
+          - pattern: |
+              new Function($REQ.body)
+    message: >
+      Unsafe deserialization or code execution from user input.
+      Never use eval() or new Function() with user-supplied data.
+      Use JSON.parse() for JSON data, and validate the schema after parsing.
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      category: security
+      cwe: CWE-502
+      owasp: A08:2021 - Software and Data Integrity Failures
+      confidence: HIGH
+
+  # ===========================================================================
+  # 6. PATH TRAVERSAL
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Rule 6a: Python - path traversal via user input
+  # ---------------------------------------------------------------------------
+  - id: path-traversal-python
+    patterns:
+      - pattern-either:
+          - pattern: |
+              open(os.path.join($BASE, $REQ.$ATTR))
+          - pattern: |
+              open($REQ.$ATTR)
+          - pattern: |
+              open(f"...{$REQ.$ATTR}...")
+    message: >
+      Potential path traversal vulnerability.
+      User-controlled input is used to construct a file path.
+      An attacker could use '../../../etc/passwd' to read arbitrary files.
+      Validate and sanitize file paths:
+        import os
+        safe_path = os.path.realpath(os.path.join(base_dir, user_input))
+        if not safe_path.startswith(base_dir):
+            raise ValueError("Invalid path")
+    severity: ERROR
+    languages: [python]
+    metadata:
+      category: security
+      cwe: CWE-22
+      owasp: A01:2021 - Broken Access Control
+      confidence: MEDIUM
+
+  # ===========================================================================
+  # 7. COMMAND INJECTION
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Rule 7a: Python - shell injection via user input
+  # ---------------------------------------------------------------------------
+  - id: command-injection-python
+    patterns:
+      - pattern-either:
+          - pattern: |
+              os.system(f"...{$VAR}...")
+          - pattern: |
+              os.system("..." + $VAR)
+          - pattern: |
+              subprocess.call(f"...{$VAR}...", shell=True)
+          - pattern: |
+              subprocess.run(f"...{$VAR}...", shell=True)
+          - pattern: |
+              subprocess.Popen(f"...{$VAR}...", shell=True)
+    message: >
+      Potential command injection vulnerability.
+      User-controlled input is passed to a shell command.
+      An attacker could inject malicious commands.
+      Use subprocess with a list of arguments instead of shell=True:
+        subprocess.run(['ls', '-la', user_input], shell=False)
+      Or use shlex.quote() if shell=True is required:
+        import shlex
+        subprocess.run(f"ls -la {shlex.quote(user_input)}", shell=True)
+    severity: ERROR
+    languages: [python]
+    metadata:
+      category: security
+      cwe: CWE-78
+      owasp: A03:2021 - Injection
+      confidence: HIGH
+
+  # ---------------------------------------------------------------------------
+  # Rule 7b: JavaScript - command injection via user input
+  # ---------------------------------------------------------------------------
+  - id: command-injection-javascript
+    patterns:
+      - pattern-either:
+          - pattern: |
+              exec(`...${$VAR}...`)
+          - pattern: |
+              exec("..." + $VAR)
+          - pattern: |
+              execSync(`...${$VAR}...`)
+          - pattern: |
+              spawn($VAR, ...)
+    message: >
+      Potential command injection vulnerability.
+      User-controlled input is passed to a shell command.
+      Use execFile() with an argument array instead of exec():
+        const { execFile } = require('child_process');
+        execFile('ls', ['-la', userInput], callback);
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      category: security
+      cwe: CWE-78
+      owasp: A03:2021 - Injection
+      confidence: HIGH
+
+  # ===========================================================================
+  # 8. INSECURE TLS/SSL CONFIGURATION
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Rule 8a: Python - SSL verification disabled
+  # ---------------------------------------------------------------------------
+  - id: ssl-verification-disabled-python
+    patterns:
+      - pattern-either:
+          - pattern: |
+              requests.get($URL, verify=False)
+          - pattern: |
+              requests.post($URL, verify=False)
+          - pattern: |
+              requests.put($URL, verify=False)
+          - pattern: |
+              requests.request($METHOD, $URL, verify=False)
+          - pattern: |
+              ssl._create_unverified_context()
+    message: >
+      SSL certificate verification is disabled.
+      This makes the connection vulnerable to man-in-the-middle attacks.
+      Remove verify=False and ensure proper certificate validation:
+        requests.get(url, verify=True)  # This is the default
+      If using a custom CA, specify the certificate bundle:
+        requests.get(url, verify='/path/to/ca-bundle.crt')
+    severity: ERROR
+    languages: [python]
+    metadata:
+      category: security
+      cwe: CWE-295
+      owasp: A02:2021 - Cryptographic Failures
+      confidence: HIGH
+
+  # ---------------------------------------------------------------------------
+  # Rule 8b: JavaScript/Node.js - SSL verification disabled
+  # ---------------------------------------------------------------------------
+  - id: ssl-verification-disabled-javascript
+    patterns:
+      - pattern-either:
+          - pattern: |
+              {rejectUnauthorized: false}
+          - pattern: |
+              process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"
+          - pattern: |
+              process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+    message: >
+      SSL certificate verification is disabled.
+      Setting rejectUnauthorized: false or NODE_TLS_REJECT_UNAUTHORIZED=0
+      makes connections vulnerable to man-in-the-middle attacks.
+      Remove this setting in production code.
+      If testing locally, use a proper self-signed certificate instead.
+    severity: ERROR
+    languages: [javascript, typescript]
+    metadata:
+      category: security
+      cwe: CWE-295
+      owasp: A02:2021 - Cryptographic Failures
+      confidence: HIGH

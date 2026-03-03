@@ -1,0 +1,467 @@
+# =============================================================================
+# GitLab CI - Complete Security Gate
+# Book Reference: Chapter 3, Section 3.2.1.2
+# =============================================================================
+# Features demonstrated:
+#   - Security dashboard integration
+#   - Merge request blocking
+#   - Approval workflow for overrides
+# =============================================================================
+#
+# SETUP REQUIRED:
+#   1. Copy thresholds.yml to your repository root as security-thresholds.yml
+#   2. Set STAGING_URL CI/CD variable
+#   3. Set SLACK_WEBHOOK_URL CI/CD variable (optional)
+#   4. Install yq in your runner or use the docker image below
+#
+# OVERRIDE MECHANISM:
+#   To bypass the security gate for an emergency:
+#   1. Set CI/CD variable SECURITY_OVERRIDE=true on the pipeline
+#   2. Set SECURITY_OVERRIDE_REASON="<your reason>"
+#   3. The security team will be notified automatically
+# =============================================================================
+
+variables:
+  THRESHOLDS_FILE: "security-thresholds.yml"
+  ARTIFACT_EXPIRE: "30 days"
+
+  # Default thresholds (used if thresholds.yml is not present)
+  # These match Table 3.4 enforcement profile
+  DEFAULT_SAST_CRITICAL_THRESHOLD: "0"
+  DEFAULT_SAST_HIGH_THRESHOLD:     "3"
+  DEFAULT_DEP_CRITICAL_THRESHOLD:  "0"
+  DEFAULT_DEP_HIGH_THRESHOLD:      "5"
+
+stages:
+  - load-config
+  - scan
+  - gate
+  - notify
+
+# =============================================================================
+# Stage: load-config
+# Parse thresholds.yml and export as dotenv artifact
+# All downstream jobs source this file to get threshold values
+# =============================================================================
+
+load-thresholds:
+  stage: load-config
+  image: mikefarah/yq:latest
+  script:
+    - |
+      echo "=== Loading Security Thresholds ==="
+
+      # Check for emergency override
+      if [ "${SECURITY_OVERRIDE}" == "true" ]; then
+        echo "⚠️  EMERGENCY OVERRIDE ACTIVE"
+        echo "Reason: ${SECURITY_OVERRIDE_REASON:-'Not provided'}"
+        echo "OVERRIDE_ACTIVE=true"  >> thresholds.env
+        echo "OVERRIDE_REASON=${SECURITY_OVERRIDE_REASON:-'Not provided'}" \
+          >> thresholds.env
+
+        # Notify security team
+        if [ -n "$SLACK_WEBHOOK_URL" ]; then
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-type: application/json' \
+            --data "{
+              \"text\": \"🚨 Security Gate Override: $CI_PROJECT_NAME - $CI_MERGE_REQUEST_IID\",
+              \"attachments\": [{
+                \"color\": \"danger\",
+                \"fields\": [
+                  {\"title\": \"Project\",  \"value\": \"$CI_PROJECT_NAME\"},
+                  {\"title\": \"MR\",       \"value\": \"$CI_MERGE_REQUEST_IID\"},
+                  {\"title\": \"Author\",   \"value\": \"$GITLAB_USER_NAME\"},
+                  {\"title\": \"Reason\",   \"value\": \"${SECURITY_OVERRIDE_REASON:-Not provided}\"}
+                ]
+              }]
+            }"
+        fi
+      else
+        echo "OVERRIDE_ACTIVE=false" >> thresholds.env
+        echo "OVERRIDE_REASON="      >> thresholds.env
+      fi
+
+      # Load from file if it exists, otherwise use defaults
+      if [ -f "$THRESHOLDS_FILE" ]; then
+        PROFILE=$(yq '.active_profile' "$THRESHOLDS_FILE")
+        echo "Active profile: $PROFILE"
+
+        # Determine environment override based on branch
+        BRANCH="$CI_COMMIT_BRANCH"
+        BASE_PATH=".profiles.$PROFILE"
+
+        if echo "$BRANCH" | grep -qE "^(main|master|release/)"; then
+          BASE_PATH=".environment_overrides.production"
+          echo "Using production environment override"
+        elif echo "$BRANCH" | grep -qE "^(staging|develop)"; then
+          BASE_PATH=".environment_overrides.staging"
+          echo "Using staging environment override"
+        fi
+
+        # Extract and export thresholds
+        SAST_CRIT=$(yq "$BASE_PATH.sast.critical.threshold" "$THRESHOLDS_FILE")
+        SAST_HIGH=$(yq "$BASE_PATH.sast.high.threshold"     "$THRESHOLDS_FILE")
+        SAST_CRIT_ACTION=$(yq "$BASE_PATH.sast.critical.action" "$THRESHOLDS_FILE")
+        SAST_HIGH_ACTION=$(yq "$BASE_PATH.sast.high.action"     "$THRESHOLDS_FILE")
+        DEP_CRIT=$(yq  "$BASE_PATH.dependency.critical.threshold" "$THRESHOLDS_FILE")
+        DEP_HIGH=$(yq  "$BASE_PATH.dependency.high.threshold"     "$THRESHOLDS_FILE")
+        DEP_CRIT_ACTION=$(yq "$BASE_PATH.dependency.critical.action" "$THRESHOLDS_FILE")
+        DEP_HIGH_ACTION=$(yq "$BASE_PATH.dependency.high.action"     "$THRESHOLDS_FILE")
+
+        echo "ACTIVE_PROFILE=$PROFILE"               >> thresholds.env
+        echo "SAST_CRITICAL_THRESHOLD=$SAST_CRIT"    >> thresholds.env
+        echo "SAST_HIGH_THRESHOLD=$SAST_HIGH"        >> thresholds.env
+        echo "SAST_CRITICAL_ACTION=$SAST_CRIT_ACTION" >> thresholds.env
+        echo "SAST_HIGH_ACTION=$SAST_HIGH_ACTION"    >> thresholds.env
+        echo "DEP_CRITICAL_THRESHOLD=$DEP_CRIT"      >> thresholds.env
+        echo "DEP_HIGH_THRESHOLD=$DEP_HIGH"          >> thresholds.env
+        echo "DEP_CRITICAL_ACTION=$DEP_CRIT_ACTION"  >> thresholds.env
+        echo "DEP_HIGH_ACTION=$DEP_HIGH_ACTION"      >> thresholds.env
+      else
+        echo "⚠️  $THRESHOLDS_FILE not found. Using enforcement defaults."
+        echo "ACTIVE_PROFILE=default"                                    >> thresholds.env
+        echo "SAST_CRITICAL_THRESHOLD=$DEFAULT_SAST_CRITICAL_THRESHOLD" >> thresholds.env
+        echo "SAST_HIGH_THRESHOLD=$DEFAULT_SAST_HIGH_THRESHOLD"         >> thresholds.env
+        echo "SAST_CRITICAL_ACTION=break"                                >> thresholds.env
+        echo "SAST_HIGH_ACTION=break"                                    >> thresholds.env
+        echo "DEP_CRITICAL_THRESHOLD=$DEFAULT_DEP_CRITICAL_THRESHOLD"   >> thresholds.env
+        echo "DEP_HIGH_THRESHOLD=$DEFAULT_DEP_HIGH_THRESHOLD"           >> thresholds.env
+        echo "DEP_CRITICAL_ACTION=break"                                 >> thresholds.env
+        echo "DEP_HIGH_ACTION=break"                                     >> thresholds.env
+      fi
+
+      echo "=== Loaded Configuration ==="
+      cat thresholds.env
+
+  artifacts:
+    reports:
+      dotenv: thresholds.env
+    expire_in: $ARTIFACT_EXPIRE
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# =============================================================================
+# Stage: scan - SAST
+# =============================================================================
+
+sast-semgrep:
+  stage: scan
+  image: returntocorp/semgrep:latest
+  needs:
+    - job: load-thresholds
+      artifacts: true
+  script:
+    - |
+      semgrep scan \
+        --config=auto \
+        --config=p/security-audit \
+        --config=p/owasp-top-ten \
+        --gitlab-sast \
+        --output=gl-sast-report.json \
+        --json \
+        --output=sast-raw.json \
+        || true
+
+    - |
+      CRITICAL=$(jq '[.results[] | select(.extra.severity == "ERROR")]   | length' \
+        sast-raw.json 2>/dev/null || echo "0")
+      HIGH=$(jq     '[.results[] | select(.extra.severity == "WARNING")] | length' \
+        sast-raw.json 2>/dev/null || echo "0")
+      MEDIUM=$(jq   '[.results[] | select(.extra.severity == "INFO")]    | length' \
+        sast-raw.json 2>/dev/null || echo "0")
+
+      echo "SAST_CRITICAL=$CRITICAL" >> sast-counts.env
+      echo "SAST_HIGH=$HIGH"         >> sast-counts.env
+      echo "SAST_MEDIUM=$MEDIUM"     >> sast-counts.env
+
+      echo "SAST: Critical=$CRITICAL High=$HIGH Medium=$MEDIUM"
+
+      # Evaluate gate
+      GATE="pass"
+      if [ "$CRITICAL" -gt "$SAST_CRITICAL_THRESHOLD" ] && \
+         [ "$SAST_CRITICAL_ACTION" == "break" ] && \
+         [ "$OVERRIDE_ACTIVE" != "true" ]; then
+        GATE="fail"
+        echo "SAST Critical threshold exceeded: $CRITICAL > $SAST_CRITICAL_THRESHOLD"
+      fi
+      if [ "$HIGH" -gt "$SAST_HIGH_THRESHOLD" ] && \
+         [ "$SAST_HIGH_ACTION" == "break" ] && \
+         [ "$OVERRIDE_ACTIVE" != "true" ]; then
+        GATE="fail"
+        echo "SAST High threshold exceeded: $HIGH > $SAST_HIGH_THRESHOLD"
+      fi
+
+      echo "SAST_GATE=$GATE" >> sast-counts.env
+
+      [ "$GATE" == "fail" ] && exit 1 || exit 0
+
+  artifacts:
+    reports:
+      sast:  gl-sast-report.json
+      dotenv: sast-counts.env
+    paths:
+      - gl-sast-report.json
+      - sast-raw.json
+      - sast-counts.env
+    when: always
+    expire_in: $ARTIFACT_EXPIRE
+
+  allow_failure: false
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH =~ /^(staging|develop)$/'
+
+# =============================================================================
+# Stage: scan - Dependency Scan
+# =============================================================================
+
+dependency-trivy:
+  stage: scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  needs:
+    - job: load-thresholds
+      artifacts: true
+  script:
+    - |
+      trivy fs \
+        --format json \
+        --output trivy-results.json \
+        --severity CRITICAL,HIGH,MEDIUM,LOW \
+        --exit-code 0 \
+        .
+
+    - |
+      CRITICAL=$(jq '[.Results[].Vulnerabilities[]? |
+        select(.Severity == "CRITICAL")] | length' \
+        trivy-results.json 2>/dev/null || echo "0")
+      HIGH=$(jq '[.Results[].Vulnerabilities[]? |
+        select(.Severity == "HIGH")] | length' \
+        trivy-results.json 2>/dev/null || echo "0")
+      MEDIUM=$(jq '[.Results[].Vulnerabilities[]? |
+        select(.Severity == "MEDIUM")] | length' \
+        trivy-results.json 2>/dev/null || echo "0")
+
+      echo "DEP_CRITICAL=$CRITICAL" >> dep-counts.env
+      echo "DEP_HIGH=$HIGH"         >> dep-counts.env
+      echo "DEP_MEDIUM=$MEDIUM"     >> dep-counts.env
+
+      echo "Dependencies: Critical=$CRITICAL High=$HIGH Medium=$MEDIUM"
+
+      GATE="pass"
+      if [ "$CRITICAL" -gt "$DEP_CRITICAL_THRESHOLD" ] && \
+         [ "$DEP_CRITICAL_ACTION" == "break" ] && \
+         [ "$OVERRIDE_ACTIVE" != "true" ]; then
+        GATE="fail"
+      fi
+      if [ "$HIGH" -gt "$DEP_HIGH_THRESHOLD" ] && \
+         [ "$DEP_HIGH_ACTION" == "break" ] && \
+         [ "$OVERRIDE_ACTIVE" != "true" ]; then
+        GATE="fail"
+      fi
+
+      echo "DEP_GATE=$GATE" >> dep-counts.env
+      [ "$GATE" == "fail" ] && exit 1 || exit 0
+
+  artifacts:
+    reports:
+      dotenv: dep-counts.env
+    paths:
+      - trivy-results.json
+      - dep-counts.env
+    when: always
+    expire_in: $ARTIFACT_EXPIRE
+
+  allow_failure: false
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH =~ /^(staging|develop)$/'
+
+# =============================================================================
+# Stage: gate - Final aggregation and MR blocking
+# =============================================================================
+
+security-gate:
+  stage: gate
+  image: alpine:latest
+  needs:
+    - job: load-thresholds
+      artifacts: true
+    - job: sast-semgrep
+      artifacts: true
+    - job: dependency-trivy
+      artifacts: true
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    - |
+      echo "=== Security Gate Final Evaluation ==="
+      echo "Profile         : $ACTIVE_PROFILE"
+      echo "SAST Gate       : $SAST_GATE"
+      echo "Dependency Gate : $DEP_GATE"
+      echo "Override Active : $OVERRIDE_ACTIVE"
+
+      OVERALL="pass"
+      if [ "$SAST_GATE" == "fail" ] || [ "$DEP_GATE" == "fail" ]; then
+        OVERALL="fail"
+      fi
+      if [ "$OVERRIDE_ACTIVE" == "true" ]; then
+        OVERALL="override"
+      fi
+
+      echo "Overall Status  : $OVERALL"
+
+      # Post MR note with results
+      if [ -n "$CI_MERGE_REQUEST_IID" ] && [ -n "$GITLAB_TOKEN" ]; then
+        STATUS_ICON="✅"
+        [ "$OVERALL" == "fail" ]     && STATUS_ICON="❌"
+        [ "$OVERALL" == "override" ] && STATUS_ICON="⚠️"
+
+        NOTE_BODY="## ${STATUS_ICON} Security Gate Results\n\n"
+        NOTE_BODY="${NOTE_BODY}**Profile:** \`$ACTIVE_PROFILE\`\n\n"
+        NOTE_BODY="${NOTE_BODY}| Scanner | Critical | High | Medium | Gate |\n"
+        NOTE_BODY="${NOTE_BODY}|---------|----------|------|--------|------|\n"
+        NOTE_BODY="${NOTE_BODY}| SAST | $SAST_CRITICAL | $SAST_HIGH | $SAST_MEDIUM | $SAST_GATE |\n"
+        NOTE_BODY="${NOTE_BODY}| Dependencies | $DEP_CRITICAL | $DEP_HIGH | $DEP_MEDIUM | $DEP_GATE |\n\n"
+        NOTE_BODY="${NOTE_BODY}**Overall:** $OVERALL\n\n"
+        NOTE_BODY="${NOTE_BODY}[View Pipeline]($CI_PIPELINE_URL)"
+
+        curl -s --request POST \
+          --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+          --header "Content-Type: application/json" \
+          --data "{\"body\": \"$NOTE_BODY\"}" \
+          "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes"
+      fi
+
+      # Final exit code
+      if [ "$OVERALL" == "fail" ]; then
+        echo "❌ Security Gate FAILED - merge blocked"
+        exit 1
+      else
+        echo "✅ Security Gate PASSED"
+        exit 0
+      fi
+
+  # This job blocking means the MR cannot be merged
+  # Configure in GitLab: Settings > Merge Requests > Status checks
+  allow_failure: false
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: always
+
+# =============================================================================
+# Stage: notify
+# =============================================================================
+
+notify-results:
+  stage: notify
+  image: alpine:latest
+  needs:
+    - job: load-thresholds
+      artifacts: true
+    - job: sast-semgrep
+      artifacts: true
+    - job: dependency-trivy
+      artifacts: true
+    - job: security-gate
+      artifacts: false
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      OVERALL_STATUS="pass"
+       [ "$SAST_GATE" == "fail" ] || [ "$DEP_GATE" == "fail" ] && OVERALL_STATUS="fail"
+      [ "$OVERRIDE_ACTIVE" == "true" ] && OVERALL_STATUS="override"
+
+      # Set display values based on status
+      case "$OVERALL_STATUS" in
+        "fail")
+          STATUS_ICON="❌"
+          STATUS_TEXT="Failed"
+          SLACK_COLOR="danger"
+          ;;
+        "override")
+          STATUS_ICON="⚠️"
+          STATUS_TEXT="Bypassed (Override)"
+          SLACK_COLOR="warning"
+          ;;
+        *)
+          STATUS_ICON="✅"
+          STATUS_TEXT="Passed"
+          SLACK_COLOR="good"
+          ;;
+      esac
+
+      if [ -n "$SLACK_WEBHOOK_URL" ]; then
+        curl -s -X POST "$SLACK_WEBHOOK_URL" \
+          -H 'Content-type: application/json' \
+          --data "{
+            \"attachments\": [{
+              \"color\": \"$SLACK_COLOR\",
+              \"title\": \"$STATUS_ICON Security Gate: $STATUS_TEXT\",
+              \"fields\": [
+                {
+                  \"title\": \"Project\",
+                  \"value\": \"$CI_PROJECT_NAME\",
+                  \"short\": true
+                },
+                {
+                  \"title\": \"Branch\",
+                  \"value\": \"$CI_COMMIT_BRANCH\",
+                  \"short\": true
+                },
+                {
+                  \"title\": \"Profile\",
+                  \"value\": \"$ACTIVE_PROFILE\",
+                  \"short\": true
+                },
+                {
+                  \"title\": \"Author\",
+                  \"value\": \"$GITLAB_USER_NAME\",
+                  \"short\": true
+                },
+                {
+                  \"title\": \"SAST Critical\",
+                  \"value\": \"${SAST_CRITICAL:-0}\",
+                  \"short\": true
+                },
+                {
+                  \"title\": \"SAST High\",
+                  \"value\": \"${SAST_HIGH:-0}\",
+                  \"short\": true
+                },
+                {
+                  \"title\": \"Dep Critical\",
+                  \"value\": \"${DEP_CRITICAL:-0}\",
+                  \"short\": true
+                },
+                {
+                  \"title\": \"Dep High\",
+                  \"value\": \"${DEP_HIGH:-0}\",
+                  \"short\": true
+                },
+                {
+                  \"title\": \"Pipeline\",
+                  \"value\": \"$CI_PIPELINE_URL\",
+                  \"short\": false
+                }
+              ]
+            }]
+          }"
+      fi
+
+  rules:
+    - when: always
+  allow_failure: true

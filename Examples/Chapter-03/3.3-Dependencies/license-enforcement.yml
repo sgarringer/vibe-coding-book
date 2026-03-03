@@ -1,0 +1,523 @@
+# =============================================================================
+# License Compliance Enforcement
+# Book Reference: Chapter 3, Section 3.3.6.3 - Example 3.17
+# =============================================================================
+#
+# PURPOSE:
+#   Blocks PRs that introduce dependencies with prohibited licenses.
+#   Extends Example 3.17 with multi-ecosystem support, configurable
+#   prohibited license lists, and an allowlist for known exceptions.
+#
+# PROHIBITED LICENSES (default - adjust for your legal requirements):
+#   GPL-2.0, GPL-3.0  : Copyleft - requires open-sourcing your code
+#   AGPL-3.0          : Network copyleft - restrictive for SaaS
+#   SSPL-1.0          : Restrictive for SaaS/cloud services
+#   LGPL (optional)   : Weak copyleft - review with legal team
+#
+# SAFE LICENSES (default allowlist):
+#   MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Unlicense,
+#   CC0-1.0, 0BSD, BlueOak-1.0.0
+#
+# SETUP REQUIRED:
+#   1. No secrets required for basic enforcement
+#   2. Create .license-allowlist if you have known exceptions
+#      (packages with GPL licenses that have been reviewed and approved)
+#   3. Adjust PROHIBITED_LICENSES env var for your legal requirements
+#
+# ALLOWLIST FORMAT (.license-allowlist):
+#   # One package per line - packages that are approved despite prohibited license
+#   # Format: package-name@version  # reason | approved-by | date
+#   some-gpl-package@1.2.3  # Used only in dev tooling, not shipped | legal-team | 2024-01-01
+# =============================================================================
+
+name: License Compliance Enforcement
+
+on:
+  pull_request:
+    branches: [ main, develop, staging ]
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+      - 'yarn.lock'
+      - 'requirements.txt'
+      - 'requirements*.txt'
+      - 'Pipfile'
+      - 'Pipfile.lock'
+      - 'pyproject.toml'
+      - 'poetry.lock'
+  push:
+    branches: [ main ]
+    paths:
+      - 'package.json'
+      - 'requirements.txt'
+
+env:
+  # Licenses that will block the PR
+  # Adjust based on your legal requirements
+  # Section 3.3.6.1: Problematic licenses
+  PROHIBITED_LICENSES: "GPL-2.0,GPL-3.0,AGPL-3.0,AGPL-3.0-only,AGPL-3.0-or-later,SSPL-1.0,LGPL-2.0,LGPL-2.1,LGPL-3.0"
+
+  # Licenses that are always safe
+  # Section 3.3.6.1: Safe licenses
+  SAFE_LICENSES: "MIT,Apache-2.0,BSD-2-Clause,BSD-3-Clause,ISC,Unlicense,CC0-1.0,0BSD,BlueOak-1.0.0"
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Job 1: Node.js license enforcement
+  # Example 3.17: Block PRs with prohibited licenses
+  # ---------------------------------------------------------------------------
+  nodejs-license-enforcement:
+    name: Node.js License Enforcement
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    outputs:
+      has_npm: ${{ steps.detect.outputs.has_npm }}
+      status: ${{ steps.enforce.outputs.status }}
+      prohibited_packages: ${{ steps.enforce.outputs.prohibited_packages }}
+      prohibited_count: ${{ steps.enforce.outputs.prohibited_count }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Detect Node.js project
+        id: detect
+        run: |
+          if [ -f package.json ]; then
+            echo "has_npm=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_npm=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Node.js
+        if: steps.detect.outputs.has_npm == 'true'
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        if: steps.detect.outputs.has_npm == 'true'
+        run: npm ci --prefer-offline
+
+      - name: Generate license report
+        if: steps.detect.outputs.has_npm == 'true'
+        run: |
+          npx license-checker \
+            --json \
+            --out licenses-npm.json \
+            --excludePrivatePackages
+
+      # -----------------------------------------------------------------------
+      # Example 3.17: Check for GPL/AGPL licenses
+      # Extended to cover all prohibited licenses from PROHIBITED_LICENSES env
+      # -----------------------------------------------------------------------
+      - name: Enforce license policy
+        id: enforce
+        if: steps.detect.outputs.has_npm == 'true'
+        run: |
+          if [ ! -f licenses-npm.json ]; then
+            echo "No license report generated"
+            echo "status=skip"             >> $GITHUB_OUTPUT
+            echo "prohibited_count=0"      >> $GITHUB_OUTPUT
+            echo "prohibited_packages="    >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Build jq regex from PROHIBITED_LICENSES env var
+          # Converts "GPL-2.0,GPL-3.0,AGPL-3.0" to "GPL-2.0|GPL-3.0|AGPL-3.0"
+          PROHIBITED_REGEX=$(echo "$PROHIBITED_LICENSES" | tr ',' '|')
+
+          echo "Checking for prohibited licenses: $PROHIBITED_LICENSES"
+          echo ""
+
+          # Example 3.17 core logic - find packages with prohibited licenses
+          PROHIBITED=$(jq -r \
+            --arg regex "$PROHIBITED_REGEX" \
+            'to_entries[] |
+             select(.value.licenses | test($regex; "i")) |
+             "\(.key) [\(.value.licenses)]"' \
+            licenses-npm.json 2>/dev/null || echo "")
+
+          # Check allowlist - remove packages that have been approved
+          ALLOWLISTED_PACKAGES=""
+          if [ -f ".license-allowlist" ]; then
+            ALLOWLISTED_PACKAGES=$(grep -v "^#" .license-allowlist | \
+              grep -v "^$" | \
+              awk '{print $1}' | \
+              xargs)
+          fi
+
+          # Filter out allowlisted packages
+          FINAL_PROHIBITED=""
+          if [ -n "$PROHIBITED" ]; then
+            while IFS= read -r line; do
+              PKG_NAME=$(echo "$line" | awk '{print $1}')
+              IS_ALLOWLISTED=false
+
+              for ALLOWED in $ALLOWLISTED_PACKAGES; do
+                # Match by package name (strip version from allowlist entry)
+                ALLOWED_NAME=$(echo "$ALLOWED" | sed 's/@[^@]*$//')
+                if [ "$PKG_NAME" == "$ALLOWED_NAME" ] || \
+                   echo "$PKG_NAME" | grep -q "^${ALLOWED_NAME}@"; then
+                  IS_ALLOWLISTED=true
+                  echo "ALLOWLISTED: $PKG_NAME (approved exception)"
+                  break
+                fi
+              done
+
+              if [ "$IS_ALLOWLISTED" == "false" ]; then
+                FINAL_PROHIBITED="$FINAL_PROHIBITED\n$line"
+              fi
+            done <<< "$PROHIBITED"
+          fi
+
+          # Count prohibited packages
+          PROHIBITED_COUNT=0
+          if [ -n "$FINAL_PROHIBITED" ]; then
+            PROHIBITED_COUNT=$(printf "$FINAL_PROHIBITED" | grep -c "." || echo "0")
+          fi
+
+          echo "prohibited_count=$PROHIBITED_COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$PROHIBITED_COUNT" -gt 0 ]; then
+            echo ""
+            echo "============================================"
+            echo "  PROHIBITED LICENSES FOUND"
+            echo "============================================"
+            printf "$FINAL_PROHIBITED\n"
+            echo "============================================"
+            echo ""
+            echo "These packages have licenses that may require"
+            echo "you to open-source your code or pay licensing fees."
+            echo ""
+            echo "Options:"
+            echo "  1. Replace the package with one that has a permissive license"
+            echo "  2. If the package is only used in dev tooling (not shipped),"
+            echo "     add it to .license-allowlist with justification"
+            echo "  3. Contact your legal team for guidance"
+
+            # Save for PR comment
+            printf "$FINAL_PROHIBITED" > prohibited-packages.txt
+
+            echo "status=fail"                                          >> $GITHUB_OUTPUT
+            echo "prohibited_packages=$(cat prohibited-packages.txt | tr '\n' '|')" >> $GITHUB_OUTPUT
+          else
+            echo "No prohibited licenses found"
+            echo "status=pass"          >> $GITHUB_OUTPUT
+            echo "prohibited_packages=" >> $GITHUB_OUTPUT
+          fi
+
+          # Also flag unknown licenses as warnings
+          UNKNOWN=$(jq -r \
+            'to_entries[] |
+             select(.value.licenses == "UNKNOWN") |
+             "\(.key)"' \
+            licenses-npm.json 2>/dev/null || echo "")
+
+          if [ -n "$UNKNOWN" ]; then
+            echo ""
+            echo "WARNING: Packages with unknown licenses (review manually):"
+            echo "$UNKNOWN"
+            echo "::warning::$(echo "$UNKNOWN" | wc -l) package(s) have unknown licenses"
+          fi
+
+      - name: Upload license report
+        if: steps.detect.outputs.has_npm == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: license-enforcement-npm-${{ github.run_number }}
+          path: |
+            licenses-npm.json
+            prohibited-packages.txt
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Python license enforcement
+  # ---------------------------------------------------------------------------
+  python-license-enforcement:
+    name: Python License Enforcement
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    outputs:
+      has_python: ${{ steps.detect.outputs.has_python }}
+      status: ${{ steps.enforce.outputs.status }}
+      prohibited_count: ${{ steps.enforce.outputs.prohibited_count }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Detect Python project
+        id: detect
+        run: |
+          if find . -name "requirements*.txt" -not -path "./.git/*" | grep -q . || \
+             [ -f Pipfile ] || [ -f pyproject.toml ]; then
+            echo "has_python=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_python=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Python
+        if: steps.detect.outputs.has_python == 'true'
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install project dependencies
+        if: steps.detect.outputs.has_python == 'true'
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt --quiet
+          elif [ -f requirements/base.txt ]; then
+            pip install -r requirements/base.txt --quiet
+          elif [ -f pyproject.toml ]; then
+            pip install . --quiet
+          fi
+
+      - name: Install pip-licenses
+        if: steps.detect.outputs.has_python == 'true'
+        run: pip install pip-licenses --quiet
+
+      - name: Generate Python license report
+        if: steps.detect.outputs.has_python == 'true'
+        run: |
+          pip-licenses \
+            --format=json \
+            --output-file=licenses-python.json \
+            --with-urls \
+            --with-description
+
+      - name: Enforce Python license policy
+        id: enforce
+        if: steps.detect.outputs.has_python == 'true'
+        run: |
+          if [ ! -f licenses-python.json ]; then
+            echo "status=skip"        >> $GITHUB_OUTPUT
+            echo "prohibited_count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          PROHIBITED_REGEX=$(echo "$PROHIBITED_LICENSES" | tr ',' '|')
+
+          echo "Checking Python packages for prohibited licenses..."
+
+          PROHIBITED=$(jq -r \
+            --arg regex "$PROHIBITED_REGEX" \
+            '.[] |
+             select(.License | test($regex; "i")) |
+             "\(.Name) \(.Version) [\(.License)]"' \
+            licenses-python.json 2>/dev/null || echo "")
+
+          # Check allowlist
+          ALLOWLISTED_PACKAGES=""
+          if [ -f ".license-allowlist" ]; then
+            ALLOWLISTED_PACKAGES=$(grep -v "^#" .license-allowlist | \
+              grep -v "^$" | \
+              awk '{print $1}' | \
+              xargs)
+          fi
+
+          FINAL_PROHIBITED=""
+          if [ -n "$PROHIBITED" ]; then
+            while IFS= read -r line; do
+              PKG_NAME=$(echo "$line" | awk '{print $1}')
+              IS_ALLOWLISTED=false
+
+              for ALLOWED in $ALLOWLISTED_PACKAGES; do
+                ALLOWED_NAME=$(echo "$ALLOWED" | sed 's/@[^@]*$//')
+                if [ "$PKG_NAME" == "$ALLOWED_NAME" ]; then
+                  IS_ALLOWLISTED=true
+                  echo "ALLOWLISTED: $PKG_NAME"
+                  break
+                fi
+              done
+
+              if [ "$IS_ALLOWLISTED" == "false" ]; then
+                FINAL_PROHIBITED="$FINAL_PROHIBITED\n$line"
+              fi
+            done <<< "$PROHIBITED"
+          fi
+
+          PROHIBITED_COUNT=0
+          if [ -n "$FINAL_PROHIBITED" ]; then
+            PROHIBITED_COUNT=$(printf "$FINAL_PROHIBITED" | grep -c "." || echo "0")
+          fi
+
+          echo "prohibited_count=$PROHIBITED_COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$PROHIBITED_COUNT" -gt 0 ]; then
+            echo ""
+            echo "============================================"
+            echo "  PROHIBITED PYTHON LICENSES FOUND"
+            echo "============================================"
+            printf "$FINAL_PROHIBITED\n"
+            echo "============================================"
+            echo "status=fail" >> $GITHUB_OUTPUT
+          else
+            echo "No prohibited Python licenses found"
+            echo "status=pass" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload Python license report
+        if: steps.detect.outputs.has_python == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: license-enforcement-python-${{ github.run_number }}
+          path: licenses-python.json
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Unified gate enforcement and PR comment
+  # ---------------------------------------------------------------------------
+  license-gate:
+    name: License Gate
+    runs-on: ubuntu-latest
+    needs:
+      - nodejs-license-enforcement
+      - python-license-enforcement
+    if: always()
+
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Evaluate overall gate
+        id: overall
+        env:
+          NPM_STATUS: ${{ needs.nodejs-license-enforcement.outputs.status }}
+          PYTHON_STATUS: ${{ needs.python-license-enforcement.outputs.status }}
+        run: |
+          OVERALL="pass"
+          [ "$NPM_STATUS"    == "fail" ] && OVERALL="fail"
+          [ "$PYTHON_STATUS" == "fail" ] && OVERALL="fail"
+          echo "status=$OVERALL" >> $GITHUB_OUTPUT
+          echo "Overall license gate: $OVERALL"
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        env:
+          OVERALL_STATUS: ${{ steps.overall.outputs.status }}
+          NPM_STATUS: ${{ needs.nodejs-license-enforcement.outputs.status }}
+          NPM_COUNT: ${{ needs.nodejs-license-enforcement.outputs.prohibited_count }}
+          NPM_PACKAGES: ${{ needs.nodejs-license-enforcement.outputs.prohibited_packages }}
+          PYTHON_STATUS: ${{ needs.python-license-enforcement.outputs.status }}
+          PYTHON_COUNT: ${{ needs.python-license-enforcement.outputs.prohibited_count }}
+          PROHIBITED_LICENSES: ${{ env.PROHIBITED_LICENSES }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const overallStatus  = process.env.OVERALL_STATUS;
+            const npmStatus      = process.env.NPM_STATUS      || 'skip';
+            const npmCount       = process.env.NPM_COUNT       || '0';
+            const npmPackages    = process.env.NPM_PACKAGES    || '';
+            const pythonStatus   = process.env.PYTHON_STATUS   || 'skip';
+            const pythonCount    = process.env.PYTHON_COUNT    || '0';
+            const prohibited     = process.env.PROHIBITED_LICENSES;
+            const runUrl         = process.env.RUN_URL;
+
+            const statusLabel = (s) => {
+              if (s === 'fail') return 'BLOCKED';
+              if (s === 'pass') return 'PASSED';
+              return 'SKIPPED';
+            };
+
+            const lines = [];
+            lines.push('## License Compliance Enforcement');
+            lines.push('');
+
+            if (overallStatus === 'fail') {
+              lines.push('Merge blocked: Packages with prohibited licenses detected.');
+            } else {
+              lines.push('All dependency licenses comply with policy.');
+            }
+
+            lines.push('');
+            lines.push('| Ecosystem | Status | Prohibited Packages |');
+            lines.push('|-----------|--------|---------------------|');
+            lines.push('| Node.js | ' + statusLabel(npmStatus) + ' | ' + npmCount + ' |');
+            lines.push('| Python  | ' + statusLabel(pythonStatus) + ' | ' + pythonCount + ' |');
+            lines.push('');
+            lines.push('**Prohibited licenses:** ' + prohibited);
+            lines.push('');
+
+            if (overallStatus === 'fail') {
+              if (npmPackages) {
+                lines.push('### Prohibited npm Packages');
+                lines.push('');
+                const pkgs = npmPackages.split('|').filter(p => p.trim());
+                pkgs.forEach(pkg => {
+                  if (pkg.trim()) lines.push('- ' + pkg.trim());
+                });
+                lines.push('');
+              }
+
+              lines.push('### How to Resolve');
+              lines.push('');
+              lines.push('**Option 1: Replace the package**');
+              lines.push('Find an alternative with a permissive license (MIT, Apache 2.0, BSD).');
+              lines.push('');
+              lines.push('**Option 2: Add to allowlist (dev-only packages)**');
+              lines.push('If the package is only used in development tooling and not shipped:');
+              lines.push('1. Add to `.license-allowlist` with justification');
+              lines.push('2. Format: `package-name@version  # reason | approved-by | date`');
+              lines.push('3. Get approval from your legal team');
+              lines.push('');
+              lines.push('**Option 3: Contact legal team**');
+              lines.push('If you need to use a GPL/AGPL package in production,');
+              lines.push('consult your legal team about licensing implications.');
+            }
+
+            lines.push('');
+            lines.push('[View full license reports](' + runUrl + ')');
+
+            const body = lines.join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('License Compliance Enforcement')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Enforce license gate
+        env:
+          OVERALL_STATUS: ${{ steps.overall.outputs.status }}
+        run: |
+          if [ "$OVERALL_STATUS" == "fail" ]; then
+            echo "License compliance gate FAILED"
+            echo "Packages with prohibited licenses must be removed or allowlisted"
+            exit 1
+          fi
+          echo "License compliance gate PASSED"

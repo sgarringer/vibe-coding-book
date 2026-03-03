@@ -1,0 +1,477 @@
+# =============================================================================
+# License Compliance Checking in CI/CD
+# Book Reference: Chapter 3, Section 3.3.6.2
+# =============================================================================
+#
+# PURPOSE:
+#   Runs license checks for Node.js and Python projects and produces
+#   human-readable reports. This workflow is informational - it reports
+#   licenses found but does not block builds.
+#
+#   For enforcement (blocking PRs with prohibited licenses) see:
+#   license-enforcement.yml
+#
+# TOOLS USED:
+#   Node.js : license-checker (Example 3.15)
+#             npx license-checker --summary
+#   Python  : pip-licenses (Example 3.16)
+#             pip-licenses --format=markdown
+#
+# SETUP REQUIRED:
+#   No secrets required.
+#   For private npm packages add NPM_TOKEN as a repository secret.
+#
+# WHEN TO USE THIS WORKFLOW:
+#   - During initial license audit of a new project
+#   - Weekly scheduled scan to catch new dependencies
+#   - When onboarding a new team to license compliance
+#   Use license-enforcement.yml once you know your baseline
+# =============================================================================
+
+name: License Compliance Check
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+      - 'yarn.lock'
+      - 'requirements.txt'
+      - 'requirements*.txt'
+      - 'Pipfile'
+      - 'Pipfile.lock'
+      - 'pyproject.toml'
+      - 'poetry.lock'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+      - 'yarn.lock'
+      - 'requirements.txt'
+      - 'requirements*.txt'
+      - 'Pipfile'
+      - 'Pipfile.lock'
+      - 'pyproject.toml'
+      - 'poetry.lock'
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Job 1: Node.js license check
+  # Example 3.15: npx license-checker --summary
+  # ---------------------------------------------------------------------------
+  nodejs-license-check:
+    name: Node.js License Check
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    outputs:
+      has_npm: ${{ steps.detect.outputs.has_npm }}
+      prohibited_count: ${{ steps.check.outputs.prohibited_count }}
+      status: ${{ steps.check.outputs.status }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Detect Node.js project
+        id: detect
+        run: |
+          if [ -f package.json ]; then
+            echo "has_npm=true" >> $GITHUB_OUTPUT
+            echo "Node.js project detected"
+          else
+            echo "has_npm=false" >> $GITHUB_OUTPUT
+            echo "No package.json found - skipping Node.js license check"
+          fi
+
+      - name: Setup Node.js
+        if: steps.detect.outputs.has_npm == 'true'
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        if: steps.detect.outputs.has_npm == 'true'
+        run: npm ci --prefer-offline
+
+      # -----------------------------------------------------------------------
+      # Example 3.15: npx license-checker --summary
+      # Prints a summary of all licenses found in the project
+      # -----------------------------------------------------------------------
+      - name: Run license-checker summary
+        if: steps.detect.outputs.has_npm == 'true'
+        run: |
+          echo "============================================"
+          echo "  Node.js License Summary (Example 3.15)"
+          echo "  npx license-checker --summary"
+          echo "============================================"
+          npx license-checker --summary
+
+      - name: Run license-checker full report
+        if: steps.detect.outputs.has_npm == 'true'
+        run: |
+          echo ""
+          echo "============================================"
+          echo "  Full License Report"
+          echo "============================================"
+          npx license-checker \
+            --json \
+            --out licenses-npm.json
+
+          npx license-checker \
+            --csv \
+            --out licenses-npm.csv
+
+          npx license-checker \
+            --markdown \
+            --out licenses-npm.md
+
+          echo "Reports generated:"
+          echo "  licenses-npm.json"
+          echo "  licenses-npm.csv"
+          echo "  licenses-npm.md"
+
+      - name: Count licenses by type
+        id: check
+        if: steps.detect.outputs.has_npm == 'true'
+        run: |
+          if [ ! -f licenses-npm.json ]; then
+            echo "prohibited_count=0" >> $GITHUB_OUTPUT
+            echo "status=skip"        >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Count packages by license category
+          MIT=$(jq '[to_entries[] | select(.value.licenses | test("MIT"; "i"))] | length' licenses-npm.json 2>/dev/null || echo "0")
+          APACHE=$(jq '[to_entries[] | select(.value.licenses | test("Apache"; "i"))] | length' licenses-npm.json 2>/dev/null || echo "0")
+          BSD=$(jq '[to_entries[] | select(.value.licenses | test("BSD"; "i"))] | length' licenses-npm.json 2>/dev/null || echo "0")
+          ISC=$(jq '[to_entries[] | select(.value.licenses | test("ISC"; "i"))] | length' licenses-npm.json 2>/dev/null || echo "0")
+          GPL=$(jq '[to_entries[] | select(.value.licenses | test("GPL"; "i"))] | length' licenses-npm.json 2>/dev/null || echo "0")
+          AGPL=$(jq '[to_entries[] | select(.value.licenses | test("AGPL"; "i"))] | length' licenses-npm.json 2>/dev/null || echo "0")
+          UNKNOWN=$(jq '[to_entries[] | select(.value.licenses == "UNKNOWN")] | length' licenses-npm.json 2>/dev/null || echo "0")
+          TOTAL=$(jq 'length' licenses-npm.json 2>/dev/null || echo "0")
+
+          PROHIBITED=$((GPL + AGPL))
+
+          echo ""
+          echo "============================================"
+          echo "  License Distribution"
+          echo "============================================"
+          echo "  Total packages : $TOTAL"
+          echo "  MIT            : $MIT"
+          echo "  Apache 2.0     : $APACHE"
+          echo "  BSD            : $BSD"
+          echo "  ISC            : $ISC"
+          echo "  GPL (review)   : $GPL"
+          echo "  AGPL (review)  : $AGPL"
+          echo "  Unknown        : $UNKNOWN"
+          echo "============================================"
+
+          echo "mit=$MIT"               >> $GITHUB_OUTPUT
+          echo "apache=$APACHE"         >> $GITHUB_OUTPUT
+          echo "bsd=$BSD"               >> $GITHUB_OUTPUT
+          echo "isc=$ISC"               >> $GITHUB_OUTPUT
+          echo "gpl=$GPL"               >> $GITHUB_OUTPUT
+          echo "agpl=$AGPL"             >> $GITHUB_OUTPUT
+          echo "unknown=$UNKNOWN"       >> $GITHUB_OUTPUT
+          echo "total=$TOTAL"           >> $GITHUB_OUTPUT
+          echo "prohibited_count=$PROHIBITED" >> $GITHUB_OUTPUT
+
+          STATUS="pass"
+          [ "$PROHIBITED" -gt 0 ] && STATUS="warn"
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: Write step summary
+        if: steps.detect.outputs.has_npm == 'true'
+        env:
+          MIT: ${{ steps.check.outputs.mit }}
+          APACHE: ${{ steps.check.outputs.apache }}
+          BSD: ${{ steps.check.outputs.bsd }}
+          ISC: ${{ steps.check.outputs.isc }}
+          GPL: ${{ steps.check.outputs.gpl }}
+          AGPL: ${{ steps.check.outputs.agpl }}
+          UNKNOWN: ${{ steps.check.outputs.unknown }}
+          TOTAL: ${{ steps.check.outputs.total }}
+        run: |
+          echo "## Node.js License Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| License | Count | Risk |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| MIT | $MIT | Safe |" >> $GITHUB_STEP_SUMMARY
+          echo "| Apache 2.0 | $APACHE | Safe |" >> $GITHUB_STEP_SUMMARY
+          echo "| BSD | $BSD | Safe |" >> $GITHUB_STEP_SUMMARY
+          echo "| ISC | $ISC | Safe |" >> $GITHUB_STEP_SUMMARY
+          echo "| GPL | $GPL | Review required |" >> $GITHUB_STEP_SUMMARY
+          echo "| AGPL | $AGPL | Review required |" >> $GITHUB_STEP_SUMMARY
+          echo "| Unknown | $UNKNOWN | Review required |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Total** | **$TOTAL** | |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload license reports
+        if: steps.detect.outputs.has_npm == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: license-report-npm-${{ github.run_number }}
+          path: |
+            licenses-npm.json
+            licenses-npm.csv
+            licenses-npm.md
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Python license check
+  # Example 3.16: pip-licenses --format=markdown
+  # ---------------------------------------------------------------------------
+  python-license-check:
+    name: Python License Check
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    outputs:
+      has_python: ${{ steps.detect.outputs.has_python }}
+      prohibited_count: ${{ steps.check.outputs.prohibited_count }}
+      status: ${{ steps.check.outputs.status }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Detect Python project
+        id: detect
+        run: |
+          if find . -name "requirements*.txt" -not -path "./.git/*" | grep -q . || \
+             [ -f Pipfile ] || [ -f pyproject.toml ]; then
+            echo "has_python=true" >> $GITHUB_OUTPUT
+            echo "Python project detected"
+          else
+            echo "has_python=false" >> $GITHUB_OUTPUT
+            echo "No Python dependency files found - skipping Python license check"
+          fi
+
+      - name: Setup Python
+        if: steps.detect.outputs.has_python == 'true'
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        if: steps.detect.outputs.has_python == 'true'
+        run: |
+          REQ_FILE=""
+          if [ -f requirements.txt ]; then
+            REQ_FILE="requirements.txt"
+          elif [ -f requirements/base.txt ]; then
+            REQ_FILE="requirements/base.txt"
+          elif [ -f requirements/production.txt ]; then
+            REQ_FILE="requirements/production.txt"
+          fi
+
+          if [ -n "$REQ_FILE" ]; then
+            pip install -r "$REQ_FILE" --quiet
+          elif [ -f Pipfile ]; then
+            pip install pipenv --quiet
+            pipenv install --quiet
+          elif [ -f pyproject.toml ]; then
+            pip install . --quiet
+          fi
+
+      # -----------------------------------------------------------------------
+      # Example 3.16: pip-licenses --format=markdown
+      # -----------------------------------------------------------------------
+      - name: Install pip-licenses
+        if: steps.detect.outputs.has_python == 'true'
+        run: pip install pip-licenses --quiet
+
+      - name: Run pip-licenses markdown report
+        if: steps.detect.outputs.has_python == 'true'
+        run: |
+          echo "============================================"
+          echo "  Python License Report (Example 3.16)"
+          echo "  pip-licenses --format=markdown"
+          echo "============================================"
+          pip-licenses --format=markdown
+
+      - name: Generate pip-licenses full reports
+        if: steps.detect.outputs.has_python == 'true'
+        run: |
+          pip-licenses --format=json   --output-file=licenses-python.json
+          pip-licenses --format=csv    --output-file=licenses-python.csv
+          pip-licenses --format=markdown --output-file=licenses-python.md
+
+          echo "Reports generated:"
+          echo "  licenses-python.json"
+          echo "  licenses-python.csv"
+          echo "  licenses-python.md"
+
+      - name: Count licenses by type
+        id: check
+        if: steps.detect.outputs.has_python == 'true'
+        run: |
+          if [ ! -f licenses-python.json ]; then
+            echo "prohibited_count=0" >> $GITHUB_OUTPUT
+            echo "status=skip"        >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          MIT=$(jq '[.[] | select(.License | test("MIT"; "i"))] | length' licenses-python.json 2>/dev/null || echo "0")
+          APACHE=$(jq '[.[] | select(.License | test("Apache"; "i"))] | length' licenses-python.json 2>/dev/null || echo "0")
+          BSD=$(jq '[.[] | select(.License | test("BSD"; "i"))] | length' licenses-python.json 2>/dev/null || echo "0")
+          GPL=$(jq '[.[] | select(.License | test("GPL"; "i"))] | length' licenses-python.json 2>/dev/null || echo "0")
+          AGPL=$(jq '[.[] | select(.License | test("AGPL"; "i"))] | length' licenses-python.json 2>/dev/null || echo "0")
+          UNKNOWN=$(jq '[.[] | select(.License == "UNKNOWN")] | length' licenses-python.json 2>/dev/null || echo "0")
+          TOTAL=$(jq 'length' licenses-python.json 2>/dev/null || echo "0")
+
+          PROHIBITED=$((GPL + AGPL))
+
+          echo ""
+          echo "============================================"
+          echo "  Python License Distribution"
+          echo "============================================"
+          echo "  Total packages : $TOTAL"
+          echo "  MIT            : $MIT"
+          echo "  Apache 2.0     : $APACHE"
+          echo "  BSD            : $BSD"
+          echo "  GPL (review)   : $GPL"
+          echo "  AGPL (review)  : $AGPL"
+          echo "  Unknown        : $UNKNOWN"
+          echo "============================================"
+
+          echo "mit=$MIT"               >> $GITHUB_OUTPUT
+          echo "apache=$APACHE"         >> $GITHUB_OUTPUT
+          echo "bsd=$BSD"               >> $GITHUB_OUTPUT
+          echo "gpl=$GPL"               >> $GITHUB_OUTPUT
+          echo "agpl=$AGPL"             >> $GITHUB_OUTPUT
+          echo "unknown=$UNKNOWN"       >> $GITHUB_OUTPUT
+          echo "total=$TOTAL"           >> $GITHUB_OUTPUT
+          echo "prohibited_count=$PROHIBITED" >> $GITHUB_OUTPUT
+
+          STATUS="pass"
+          [ "$PROHIBITED" -gt 0 ] && STATUS="warn"
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: Upload license reports
+        if: steps.detect.outputs.has_python == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: license-report-python-${{ github.run_number }}
+          path: |
+            licenses-python.json
+            licenses-python.csv
+            licenses-python.md
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Post unified PR comment
+  # ---------------------------------------------------------------------------
+  license-summary:
+    name: License Check Summary
+    runs-on: ubuntu-latest
+    needs:
+      - nodejs-license-check
+      - python-license-check
+    if: always() && github.event_name == 'pull_request'
+
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Post PR comment
+        uses: actions/github-script@v6
+        env:
+          NPM_STATUS: ${{ needs.nodejs-license-check.outputs.status }}
+          NPM_PROHIBITED: ${{ needs.nodejs-license-check.outputs.prohibited_count }}
+          PYTHON_STATUS: ${{ needs.python-license-check.outputs.status }}
+          PYTHON_PROHIBITED: ${{ needs.python-license-check.outputs.prohibited_count }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const npmStatus      = process.env.NPM_STATUS      || 'skip';
+            const npmProhibited  = process.env.NPM_PROHIBITED  || '0';
+            const pyStatus       = process.env.PYTHON_STATUS   || 'skip';
+            const pyProhibited   = process.env.PYTHON_PROHIBITED || '0';
+            const runUrl         = process.env.RUN_URL;
+
+            const hasIssues = npmStatus === 'warn' || pyStatus === 'warn';
+
+            const statusLabel = (s) => {
+              if (s === 'warn') return 'REVIEW REQUIRED';
+              if (s === 'pass') return 'PASSED';
+              return 'SKIPPED';
+            };
+
+            const lines = [];
+            lines.push('## License Compliance Check');
+            lines.push('');
+
+            if (hasIssues) {
+              lines.push('Packages with licenses that require review were found.');
+              lines.push('Review the workflow logs and artifacts for the full report.');
+            } else {
+              lines.push('All dependency licenses are within acceptable categories.');
+            }
+
+            lines.push('');
+            lines.push('| Ecosystem | Status | Packages Requiring Review |');
+            lines.push('|-----------|--------|--------------------------|');
+            lines.push('| Node.js (license-checker) | ' + statusLabel(npmStatus) + ' | ' + npmProhibited + ' |');
+            lines.push('| Python (pip-licenses)     | ' + statusLabel(pyStatus)  + ' | ' + pyProhibited  + ' |');
+            lines.push('');
+
+            if (hasIssues) {
+              lines.push('### License Categories');
+              lines.push('');
+              lines.push('| License | Risk | Action |');
+              lines.push('|---------|------|--------|');
+              lines.push('| MIT, Apache 2.0, BSD, ISC | Safe | No action needed |');
+              lines.push('| GPL, LGPL | Review required | May require open-sourcing your code |');
+              lines.push('| AGPL | Review required | Restrictive for SaaS applications |');
+              lines.push('| SSPL | Review required | Restrictive for SaaS applications |');
+              lines.push('| UNKNOWN | Review required | Determine license before shipping |');
+              lines.push('');
+              lines.push('Contact your legal team if you are unsure about a specific license.');
+            }
+
+            lines.push('');
+            lines.push('[View full license reports](' + runUrl + ')');
+
+            const body = lines.join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('License Compliance Check')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

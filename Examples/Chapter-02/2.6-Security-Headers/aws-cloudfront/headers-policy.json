@@ -1,0 +1,36 @@
+{
+  "Comment": "Security headers policy for Chapter 2.6",
+  "Name": "SecurityHeadersPolicy",
+  "SecurityHeadersConfig": {
+    "StrictTransportSecurity": {
+      "Override": true,
+      "IncludeSubdomains": true,
+      "Preload": true,
+      "AccessControlMaxAgeSec": 31536000
+    },
+    "FrameOptions": {
+      "Override": true,
+      "FrameOption": "DENY"
+    },
+    "ContentTypeOptions": {
+      "Override": true
+    },
+    "ReferrerPolicy": {
+      "Override": true,
+      "ReferrerPolicy": "strict-origin-when-cross-origin"
+    },
+    "ContentSecurityPolicy": {
+      "Override": true,
+      "ContentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; connect-src 'self'; font-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'self';"
+    }
+  },
+  "CustomHeadersConfig": {
+    "Items": [
+      {
+        "Header": "Permissions-Policy",
+        "Value": "geolocation=(), microphone=(), camera=()",
+        "Override": true
+      }
+    ]
+  }
+}
